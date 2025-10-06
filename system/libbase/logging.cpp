@@ -535,9 +535,13 @@ void LogMessage::LogLine(const char* file, unsigned int line, LogSeverity severi
         gDefaultTag = new std::string(getprogname());
       }
 
-      Logger()(DEFAULT, severity, gDefaultTag->c_str(), file, line, message);
+      // Logger()(DEFAULT, severity, gDefaultTag->c_str(), file, line, message);
+      LoggerHolder::get_logger()->log(spdlog::level::debug, "{} [{}] {} {} {} {}",
+         DEFAULT, severity, gDefaultTag->c_str(), file, line, message);
     } else {
-      Logger()(DEFAULT, severity, tag, file, line, message);
+      // Logger()(DEFAULT, severity, tag, file, line, message);
+      LoggerHolder::get_logger()->log(spdlog::level::debug, "{} [{}] {} {} {} {}",
+        DEFAULT, severity, tag, file, line, message);
     }
   }
 }

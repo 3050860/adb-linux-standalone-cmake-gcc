@@ -15,8 +15,25 @@
  */
 
 
-#define __builtin_available(x,y) 0
+
 #pragma once
+#define __builtin_available(x,y) 0
+
+#include <unistd.h>
+#include <sys/stat.h>
+
+#ifdef isatty
+#undef isatty
+#endif
+#ifdef mkdir
+#undef mkdir
+#endif
+
+#include <cstdio>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 //
 // Google-style C++ logging.
@@ -67,6 +84,7 @@
 #include <functional>
 #include <memory>
 #include <ostream>
+#include <iostream>
 
 #include "android-base/errno_restorer.h"
 #include "android-base/macros.h"
@@ -222,6 +240,36 @@ struct LogAbortAfterFullExpr {
   ::android::base::LogMessage(__FILE__, __LINE__, SEVERITY_LAMBDA(severity), _LOG_TAG_INTERNAL, \
                               -1)                                                               \
       .stream()
+
+class LoggerHolder {
+public:
+    static std::shared_ptr<spdlog::logger>& get_logger() {
+        static std::shared_ptr<spdlog::logger> logger;
+        static std::once_flag init_flag;
+
+        // Thread-safe инициализация логгера
+        std::call_once(init_flag, []() {
+            std::shared_ptr<spdlog::sinks::sink> sink;
+
+            // Попытка создать rotating file sink для /var/log/adb.log
+            try {
+                sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>("/var/log/adb.log", 5 * 1024 * 1024, 3);
+            } catch (const spdlog::spdlog_ex& ex) {
+                // Fallback на stderr при ошибке
+                sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+                std::cerr << "Failed to open /var/log/adb.log: " << ex.what() << ". Falling back to stderr." << std::endl;
+            }
+
+            // Создаём логгер
+            logger = std::make_shared<spdlog::logger>("adb", sink);
+            logger->set_level(spdlog::level::debug);
+            logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+            spdlog::set_default_logger(logger);
+        });
+
+        return logger;
+    }
+};
 
 // Logs a message to logcat on Android otherwise to stderr. If the severity is
 // FATAL it also causes an abort. For example:

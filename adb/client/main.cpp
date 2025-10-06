@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <thread>
+#include <iostream>
 
 #include <android-base/errors.h>
 #include <android-base/file.h>
@@ -47,6 +48,11 @@
 #endif
 const char** __adb_argv;
 const char** __adb_envp;
+
+void init_spd_logger() {
+    android::base::LoggerHolder::get_logger();
+}
+
 
 static void setup_daemon_logging() {
     const std::string log_file_path(GetLogFilePath());
@@ -246,6 +252,7 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, const char* o
 int main(int argc, char* argv[], char* envp[]) {
     __adb_argv = const_cast<const char**>(argv);
     __adb_envp = const_cast<const char**>(envp);
+    init_spd_logger();
     adb_trace_init(argv);
     return adb_commandline(argc - 1, const_cast<const char**>(argv + 1));
 }
