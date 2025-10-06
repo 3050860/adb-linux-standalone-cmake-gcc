@@ -4,6 +4,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 project(ADB)
 
+include(ExternalProject)
+ExternalProject_Add(boringssl
+    GIT_REPOSITORY "https://github.com/google/boringssl.git"
+    GIT_TAG "0.20251002.0"
+    SOURCE_DIR "${PROJECT_BINARY_DIR}/external/boringssl"
+    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl -DCMAKE_CXX_FLAGS="-fPIC" -DBUILD_SHARED_LIBS=1
+)
+set(BORINGSSL_INCLUDE_DIRS ${PROJECT_BINARY_DIR}/lib/boringssl/include)
+set(BORINGSSL_LIBRARIES
+#    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
+#    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.so
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.so
+)
+
+
+
 add_compile_options(-Wall -Wextra -Wno-error -Wno-non-virtual-dtor -Wno-unknown-pragmas -Wno-attributes -Wno-unused-parameter -Wno-missing-field-initializers -Wvla -DADB_HOST=1 -D__linux__=1)
 
 set(SOURCES
@@ -134,13 +151,14 @@ target_include_directories(adb PRIVATE
     # ${CMAKE_SOURCE_DIR}/external/openscreen/platform/api
     # ${CMAKE_SOURCE_DIR}/external/openscreen
     ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_BINARY_DIR}/lib/boringssl/include
 )
 add_subdirectory(libbuildversion build)
 add_subdirectory(system/core/diagnose_usb diagnose_usb)
 add_subdirectory(system/libbase base)
 
 add_subdirectory(system/libziparchive ziparchive)
-add_subdirectory(third_party/boringssl/src)
+#add_subdirectory(third_party/boringssl/src)
 add_subdirectory(third_party/libcrypto_utils crypto_utils)
 # add_subdirectory(third_party/openscreen/src)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src/platform/api)
@@ -204,13 +222,14 @@ target_link_libraries(cutils base)
 add_subdirectory(system/liblog log)
 add_subdirectory(system/core/libutils utils)
 
-target_link_libraries(adb PRIVATE diagnose_usb crypto ssl crypto_utils build cutils ziparchive
+target_link_libraries(adb PRIVATE
+    ${BORINGSSL_LIBRARIES}
+    diagnose_usb crypto ssl crypto_utils build cutils ziparchive
     ${LIBUSB_LIBRARIES}
     ${Protobuf_LIBRARIES}
     ${BROTLI_LIBRARIES}
     ${LZ4_LIBRARIES}
     ${ZSTD_LIBRARIES}
-
 )  # Линковка
 target_include_directories(adb PRIVATE 
     ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
