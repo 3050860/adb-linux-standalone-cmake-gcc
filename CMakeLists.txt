@@ -30,6 +30,9 @@ if (NOT HAVE_STRLCPY)
     endif()
 endif()
 
+find_package(spdlog REQUIRED)
+find_package(fmt REQUIRED)
+
 add_compile_options(-Wall -Wextra -Wno-error -Wno-non-virtual-dtor -Wno-unknown-pragmas -Wno-attributes -Wno-unused-parameter -Wno-missing-field-initializers -Wvla -DADB_HOST=1 -D__linux__=1)
 
 set(SOURCES
@@ -255,6 +258,7 @@ if (NEED_LIBBSD)
     target_include_directories(adb PRIVATE ${LIBBSD_INCLUDE_DIRS})
     target_link_libraries(adb PRIVATE ${LIBBSD_LIBRARIES})
 endif()
+target_link_libraries(adb PRIVATE spdlog::spdlog fmt::fmt)
 
 target_include_directories(ziparchive PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
