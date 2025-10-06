@@ -9,7 +9,7 @@
         "type": "cppdbg",
         "request": "launch",
         "program": "${workspaceFolder}/build/adb",
-        "args": ["-L", "tcp:5037", "fork-server", "server", "--reply-fd", "5"],
+        "args": ["-L", "tcp:5037", "fork-server", "server", "--reply-fd", "16"],
         // "args": [ "devices" ],
         "stopAtEntry": false,
         "cwd": "${workspaceFolder}/build",
