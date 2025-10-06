@@ -24,7 +24,15 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+//#include <string.h>
+#ifdef __linux__
+    // Если версия glibc < 2.38, включаем <bsd/string.h>
+#if !defined(__GLIBC__) || (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 38))
+#include <bsd/string.h>
+#endif
+#else
+#include <string.h> // Для других систем пробуем стандартный string.h
+#endif
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/stat.h>

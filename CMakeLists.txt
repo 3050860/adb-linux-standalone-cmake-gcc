@@ -13,13 +13,22 @@ ExternalProject_Add(boringssl
 )
 set(BORINGSSL_INCLUDE_DIRS ${PROJECT_BINARY_DIR}/lib/boringssl/include)
 set(BORINGSSL_LIBRARIES
-#    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
-#    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
     ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.so
     ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.so
 )
 
+include(CheckFunctionExists)
+find_package(PkgConfig)
+check_function_exists(strlcpy HAVE_STRLCPY)
 
+if (NOT HAVE_STRLCPY)
+    pkg_check_modules(LIBBSD REQUIRED libbsd)
+    if (LIBBSD_FOUND)
+        set(NEED_LIBBSD TRUE)
+    else()
+        message(WARNING "strlcpy not found in standard library, and libbsd is not available. You may need to install libbsd-dev.")
+    endif()
+endif()
 
 add_compile_options(-Wall -Wextra -Wno-error -Wno-non-virtual-dtor -Wno-unknown-pragmas -Wno-attributes -Wno-unused-parameter -Wno-missing-field-initializers -Wvla -DADB_HOST=1 -D__linux__=1)
 
@@ -90,16 +99,19 @@ set(SOURCES
 )
 # find_package(OpenSSL REQUIRED)
 find_package(Protobuf REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
+#find_package(PkgConfig REQUIRED)
+
+#pkg_check_modules(LIBBSD REQUIRED libbsd)
+
+#pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 pkg_check_modules(BROTLI REQUIRED libbrotlicommon libbrotlienc libbrotlidec)
 pkg_check_modules(LZ4 REQUIRED liblz4)
 pkg_check_modules(ZSTD REQUIRED libzstd)
 
-include_directories(${LIBUSB_INCLUDE_DIRS})
+#include_directories(${LIBUSB_INCLUDE_DIRS})
 
-message("LIBUSB_INCLUDE_DIRS: ${LIBUSB_INCLUDE_DIRS}")
-
+#message("LIBUSB_INCLUDE_DIRS: ${LIBUSB_INCLUDE_DIRS}")
+#message("LIBBSD_LIBRARIES: ${LIBBSD_LIBRARIES}")
 
 # Генерация protobuf
 # protobuf_generate_cpp(APK_PROTO_SRCS APK_PROTO_HDRS adb/fastdeploy/proto/ApkEntry.proto)
@@ -152,6 +164,7 @@ target_include_directories(adb PRIVATE
     # ${CMAKE_SOURCE_DIR}/external/openscreen
     ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_BINARY_DIR}/lib/boringssl/include
+#    ${LIBBSD_INCLUDE_DIRS}
 )
 add_subdirectory(libbuildversion build)
 add_subdirectory(system/core/diagnose_usb diagnose_usb)
@@ -225,18 +238,23 @@ add_subdirectory(system/core/libutils utils)
 target_link_libraries(adb PRIVATE
     ${BORINGSSL_LIBRARIES}
     diagnose_usb crypto ssl crypto_utils build cutils ziparchive
-    ${LIBUSB_LIBRARIES}
+#    ${LIBUSB_LIBRARIES}
     ${Protobuf_LIBRARIES}
     ${BROTLI_LIBRARIES}
     ${LZ4_LIBRARIES}
     ${ZSTD_LIBRARIES}
+#    ${LIBBSD_LIBRARIES}
 )  # Линковка
 target_include_directories(adb PRIVATE 
     ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
     ${CMAKE_SOURCE_DIR}/third_party/libcrypto_utils/include
     ${CMAKE_SOURCE_DIR}/system/libziparchive/include
+)
 
-)  # Headers
+if (NEED_LIBBSD)
+    target_include_directories(adb PRIVATE ${LIBBSD_INCLUDE_DIRS})
+    target_link_libraries(adb PRIVATE ${LIBBSD_LIBRARIES})
+endif()
 
 target_include_directories(ziparchive PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
