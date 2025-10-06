@@ -34,7 +34,7 @@ static void fdevent_interrupt(int fd, unsigned, void*) {
     uint64_t buf;
     ssize_t rc = TEMP_FAILURE_RETRY(adb_read(fd, &buf, sizeof(buf)));
     if (rc == -1) {
-        PLOG(FATAL) << "failed to read from fdevent interrupt fd";
+        PLOG(ERROR) << "failed to read from fdevent interrupt fd";
     }
 }
 

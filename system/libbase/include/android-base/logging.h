@@ -17,7 +17,10 @@
 
 
 #pragma once
+
+#ifndef __builtin_available
 #define __builtin_available(x,y) 0
+#endif
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -253,7 +256,7 @@ public:
 
             // Попытка создать rotating file sink для /var/log/adb.log
             try {
-                sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>("/var/log/adb.log", 5 * 1024 * 1024, 3);
+                sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>("/var/log/adb.log", 500 * 1024 * 1024, 3);
             } catch (const spdlog::spdlog_ex& ex) {
                 // Fallback на stderr при ошибке
                 sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();

@@ -30,7 +30,7 @@ target_include_directories(base PRIVATE
     ${CMAKE_SOURCE_DIR}/system/libbase/include
     ${CMAKE_SOURCE_DIR}/system/liblog/include
 )
-target_compile_definitions(base PRIVATE
-    __builtin_available=0  # Отключает проверки __builtin_available
-)
+# target_compile_definitions(base PRIVATE
+#     __builtin_available=0  # Отключает проверки __builtin_available
+# )
 target_compile_options(base PUBLIC -fPIC)

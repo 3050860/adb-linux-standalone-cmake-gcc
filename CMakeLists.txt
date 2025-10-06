@@ -182,10 +182,6 @@ add_subdirectory(third_party/libcrypto_utils crypto_utils)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src/discovery/dnssd/public)  # Для dnssd
 
 # Список исходников для libcutils
-file(GLOB LIBCUTILS_SOURCES1
-    "system/core/libcutils/*.c"
-    "system/core/libcutils/*.cpp"
-)
 set(LIBCUTILS_SOURCES
 system/core/libcutils/android_get_control_file.cpp
 system/core/libcutils/android_reboot.cpp

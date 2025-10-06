@@ -91,7 +91,7 @@ int adb_trace_mask;
 
 std::string get_trace_setting() {
 #if ADB_HOST || !defined(__ANDROID__)
-    const char* setting = getenv("ADB_TRACE");
+    const char* setting = "all";//getenv("ADB_TRACE");
     if (setting == nullptr) {
         setting = "";
     }

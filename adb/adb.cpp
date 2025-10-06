@@ -784,252 +784,6 @@ bool is_one_device_mandatory() {
 }
 
 int launch_server(const std::string& socket_spec, const char* one_device) {
-#if defined(_WIN32)
-    /* we need to start the server in the background                    */
-    /* we create a PIPE that will be used to wait for the server's "OK" */
-    /* message since the pipe handles must be inheritable, we use a     */
-    /* security attribute                                               */
-    SECURITY_ATTRIBUTES   sa;
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = TRUE;
-
-    // Redirect stdin to Windows /dev/null. If we instead pass an original
-    // stdin/stdout/stderr handle and it is a console handle, when the adb
-    // server starts up, the C Runtime will see a console handle for a process
-    // that isn't connected to a console and it will configure
-    // stdin/stdout/stderr to be closed. At that point, freopen() could be used
-    // to reopen stderr/out, but it would take more massaging to fixup the file
-    // descriptor number that freopen() uses. It's simplest to avoid all of this
-    // complexity by just redirecting stdin to `nul' and then the C Runtime acts
-    // as expected.
-    unique_handle   nul_read(CreateFileW(L"nul", GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL, NULL));
-    if (nul_read.get() == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "adb: CreateFileW 'nul' failed: %s\n",
-                android::base::SystemErrorCodeToString(GetLastError()).c_str());
-        return -1;
-    }
-
-    // Create pipes with non-inheritable read handle, inheritable write handle. We need to connect
-    // the subprocess to pipes instead of just letting the subprocess inherit our existing
-    // stdout/stderr handles because a DETACHED_PROCESS cannot write to a console that it is not
-    // attached to.
-    unique_handle   ack_read, ack_write;
-    if (!_create_anonymous_pipe(&ack_read, &ack_write, &sa)) {
-        return -1;
-    }
-    unique_handle   stdout_read, stdout_write;
-    if (!_create_anonymous_pipe(&stdout_read, &stdout_write, &sa)) {
-        return -1;
-    }
-    unique_handle   stderr_read, stderr_write;
-    if (!_create_anonymous_pipe(&stderr_read, &stderr_write, &sa)) {
-        return -1;
-    }
-
-    /* Some programs want to launch an adb command and collect its output by
-     * calling CreateProcess with inheritable stdout/stderr handles, then
-     * using read() to get its output. When this happens, the stdout/stderr
-     * handles passed to the adb client process will also be inheritable.
-     * When starting the adb server here, care must be taken to reset them
-     * to non-inheritable.
-     * Otherwise, something bad happens: even if the adb command completes,
-     * the calling process is stuck while read()-ing from the stdout/stderr
-     * descriptors, because they're connected to corresponding handles in the
-     * adb server process (even if the latter never uses/writes to them).
-     * Note that even if we don't pass these handles in the STARTUPINFO struct,
-     * if they're marked inheritable, they're still inherited, requiring us to
-     * deal with this.
-     *
-     * If we're still having problems with inheriting random handles in the
-     * future, consider using PROC_THREAD_ATTRIBUTE_HANDLE_LIST to explicitly
-     * specify which handles should be inherited: http://blogs.msdn.com/b/oldnewthing/archive/2011/12/16/10248328.aspx
-     *
-     * Older versions of Windows return console pseudo-handles that cannot be
-     * made non-inheritable, so ignore those failures.
-     */
-    _try_make_handle_noninheritable(GetStdHandle(STD_INPUT_HANDLE));
-    _try_make_handle_noninheritable(GetStdHandle(STD_OUTPUT_HANDLE));
-    _try_make_handle_noninheritable(GetStdHandle(STD_ERROR_HANDLE));
-
-    STARTUPINFOW    startup;
-    ZeroMemory( &startup, sizeof(startup) );
-    startup.cb = sizeof(startup);
-    startup.hStdInput  = nul_read.get();
-    startup.hStdOutput = stdout_write.get();
-    startup.hStdError  = stderr_write.get();
-    startup.dwFlags    = STARTF_USESTDHANDLES;
-
-    // Verify that the pipe_write handle value can be passed on the command line
-    // as %d and that the rest of adb code can pass it around in an int.
-    const int ack_write_as_int = cast_handle_to_int(ack_write.get());
-    if (cast_int_to_handle(ack_write_as_int) != ack_write.get()) {
-        // If this fires, either handle values are larger than 32-bits or else
-        // there is a bug in our casting.
-        // https://msdn.microsoft.com/en-us/library/windows/desktop/aa384203%28v=vs.85%29.aspx
-        fprintf(stderr, "adb: cannot fit pipe handle value into 32-bits: 0x%p\n", ack_write.get());
-        return -1;
-    }
-
-    // get path of current program
-    WCHAR       program_path[MAX_PATH];
-    const DWORD module_result = GetModuleFileNameW(NULL, program_path,
-                                                   arraysize(program_path));
-    if ((module_result >= arraysize(program_path)) || (module_result == 0)) {
-        // String truncation or some other error.
-        fprintf(stderr, "adb: cannot get executable path: %s\n",
-                android::base::SystemErrorCodeToString(GetLastError()).c_str());
-        return -1;
-    }
-
-    std::vector<std::string> child_argv = {"adb", "-L", socket_spec};
-    if (gListenAll) {
-        child_argv.push_back("-a");
-    }
-    child_argv.push_back("fork-server");
-    child_argv.push_back("server");
-    child_argv.push_back("--reply-fd");
-    child_argv.push_back(std::to_string(ack_write_as_int));
-    if (one_device) {
-        child_argv.push_back("--one-device");
-        child_argv.push_back(one_device);
-    }
-    // Ideally we'd do CommandLineToArgvW-like quoting, but this is probably
-    // sufficient for the arguments we have.
-    std::string cmdline = android::base::Join(child_argv, ' ');
-    std::wstring cmdline_wide;
-    if (!android::base::UTF8ToWide(cmdline, &cmdline_wide)) {
-        fprintf(stderr, "adb: could not convert cmdline from UTF-8 to UTF-16: %s\n",
-                cmdline.c_str());
-        return -1;
-    }
-
-    PROCESS_INFORMATION   pinfo;
-    ZeroMemory(&pinfo, sizeof(pinfo));
-
-    if (!CreateProcessW(
-            program_path,                              /* program path  */
-            cmdline_wide.data(),
-                                    /* the fork-server argument will set the
-                                       debug = 2 in the child           */
-            NULL,                   /* process handle is not inheritable */
-            NULL,                    /* thread handle is not inheritable */
-            TRUE,                          /* yes, inherit some handles */
-            DETACHED_PROCESS, /* the new process doesn't have a console */
-            NULL,                     /* use parent's environment block */
-            NULL,                    /* use parent's starting directory */
-            &startup,                 /* startup info, i.e. std handles */
-            &pinfo )) {
-        fprintf(stderr, "adb: CreateProcessW failed: %s\n",
-                android::base::SystemErrorCodeToString(GetLastError()).c_str());
-        return -1;
-    }
-
-    unique_handle   process_handle(pinfo.hProcess);
-    pinfo.hProcess = NULL;
-
-    // Close handles that we no longer need to complete the rest.
-    CloseHandle(pinfo.hThread);
-    pinfo.hThread = NULL;
-
-    nul_read.reset();
-    ack_write.reset();
-    stdout_write.reset();
-    stderr_write.reset();
-
-    // Start threads to read from subprocess stdout/stderr and write to ours to make subprocess
-    // errors easier to diagnose. Note that the threads internally create inheritable handles, but
-    // that is ok because we've already spawned the subprocess.
-
-    // In the past, reading from a pipe before the child process's C Runtime
-    // started up and called GetFileType() caused a hang: http://blogs.msdn.com/b/oldnewthing/archive/2011/12/02/10243553.aspx#10244216
-    // This is reportedly fixed in Windows Vista: https://support.microsoft.com/en-us/kb/2009703
-    // I was unable to reproduce the problem on Windows XP. It sounds like a
-    // Windows Update may have fixed this: https://www.duckware.com/tech/peeknamedpipe.html
-    unique_handle   stdout_thread(reinterpret_cast<HANDLE>(
-            _beginthreadex(NULL, 0, _redirect_stdout_thread, stdout_read.get(),
-                           0, NULL)));
-    if (stdout_thread.get() == nullptr) {
-        fprintf(stderr, "adb: cannot create thread: %s\n", strerror(errno));
-        return -1;
-    }
-    stdout_read.release();  // Transfer ownership to new thread
-
-    unique_handle   stderr_thread(reinterpret_cast<HANDLE>(
-            _beginthreadex(NULL, 0, _redirect_stderr_thread, stderr_read.get(),
-                           0, NULL)));
-    if (stderr_thread.get() == nullptr) {
-        fprintf(stderr, "adb: cannot create thread: %s\n", strerror(errno));
-        return -1;
-    }
-    stderr_read.release();  // Transfer ownership to new thread
-
-    bool    got_ack = false;
-
-    // Wait for the "OK\n" message, for the pipe to be closed, or other error.
-    {
-        char    temp[3];
-        DWORD   count = 0;
-
-        if (ReadFile(ack_read.get(), temp, sizeof(temp), &count, NULL)) {
-            const CHAR  expected[] = "OK\n";
-            const DWORD expected_length = arraysize(expected) - 1;
-            if (count == expected_length &&
-                memcmp(temp, expected, expected_length) == 0) {
-                got_ack = true;
-            } else {
-                ReportServerStartupFailure(pinfo.dwProcessId);
-                return -1;
-            }
-        } else {
-            const DWORD err = GetLastError();
-            // If the ACK was not written and the process exited, GetLastError()
-            // is probably ERROR_BROKEN_PIPE, in which case that info is not
-            // useful to the user.
-            fprintf(stderr, "could not read ok from ADB Server%s\n",
-                    err == ERROR_BROKEN_PIPE ? "" :
-                    android::base::StringPrintf(": %s",
-                            android::base::SystemErrorCodeToString(err).c_str()).c_str());
-        }
-    }
-
-    // Always try to wait a bit for threads reading stdout/stderr to finish.
-    // If the process started ok, it should close the pipes causing the threads
-    // to finish. If the process had an error, it should exit, also causing
-    // the pipes to be closed. In that case we want to read all of the output
-    // and write it out so that the user can diagnose failures.
-    const DWORD     thread_timeout_ms = 15 * 1000;
-    const HANDLE    threads[] = { stdout_thread.get(), stderr_thread.get() };
-    const DWORD     wait_result = WaitForMultipleObjects(arraysize(threads),
-            threads, TRUE, thread_timeout_ms);
-    if (wait_result == WAIT_TIMEOUT) {
-        // Threads did not finish after waiting a little while. Perhaps the
-        // server didn't close pipes, or it is hung.
-        fprintf(stderr, "adb: timed out waiting for threads to finish reading from ADB server\n");
-        // Process handles are signaled when the process exits, so if we wait
-        // on the handle for 0 seconds and it returns 'timeout', that means that
-        // the process is still running.
-        if (WaitForSingleObject(process_handle.get(), 0) == WAIT_TIMEOUT) {
-            // We could TerminateProcess(), but that seems somewhat presumptive.
-            fprintf(stderr, "adb: server is running with process id %lu\n", pinfo.dwProcessId);
-        }
-        return -1;
-    }
-
-    if (wait_result != WAIT_OBJECT_0) {
-        fprintf(stderr, "adb: unexpected result waiting for threads: %lu: %s\n", wait_result,
-                android::base::SystemErrorCodeToString(GetLastError()).c_str());
-        return -1;
-    }
-
-    // For now ignore the thread exit codes and assume they worked properly.
-
-    if (!got_ack) {
-        return -1;
-    }
-#else /* !defined(_WIN32) */
     // set up a pipe so the child can tell us when it is ready.
     unique_fd pipe_read, pipe_write;
     if (!Pipe(&pipe_read, &pipe_write)) {
@@ -1060,6 +814,16 @@ int launch_server(const std::string& socket_spec, const char* one_device) {
     }
     child_argv.push_back(nullptr);
 
+    std::stringstream ss;
+    for (size_t i = 0; i < child_argv.size(); ++i) {
+        ss << child_argv[i];
+        if (i < child_argv.size() - 1) {
+            ss << " ";
+        }
+    }
+    
+    VLOG(ADB) << "starting server, args: " << ss.str();
+
     pid_t pid = fork();
     if (pid < 0) return -1;
 
@@ -1076,23 +840,24 @@ int launch_server(const std::string& socket_spec, const char* one_device) {
         fprintf(stderr, "adb: execl returned %d: %s\n", result, strerror(errno));
         _exit(127);
     } else {
-        // parent side of the fork
-        char temp[3] = {};
-        // wait for the "OK\n" message
-        pipe_write.reset();
-        int ret = adb_read(pipe_read.get(), temp, 3);
-        int saved_errno = errno;
-        pipe_read.reset();
-        if (ret < 0) {
-            fprintf(stderr, "could not read ok from ADB Server, errno = %d\n", saved_errno);
-            return -1;
-        }
-        if (ret != 3 || temp[0] != 'O' || temp[1] != 'K' || temp[2] != '\n') {
-            ReportServerStartupFailure(pid);
-            return -1;
-        }
+        // DON'T WAIT OK FROM SERVER
+        // // parent side of the fork
+        // char temp[3] = {};
+        // // wait for the "OK\n" message
+        // pipe_write.reset();
+        // int ret = adb_read(pipe_read.get(), temp, 3);
+        // int saved_errno = errno;
+        // pipe_read.reset();
+        // if (ret < 0) {
+        //     fprintf(stderr, "could not read ok from ADB Server, errno = %d\n", saved_errno);
+        //     return -1;
+        // }
+        // if (ret != 3 || temp[0] != 'O' || temp[1] != 'K' || temp[2] != '\n') {
+        //     ReportServerStartupFailure(pid);
+        //     return -1;
+        // }
     }
-#endif /* !defined(_WIN32) */
+
     return 0;
 }
 #endif /* ADB_HOST */

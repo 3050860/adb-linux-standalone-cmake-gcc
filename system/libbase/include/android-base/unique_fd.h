@@ -195,33 +195,9 @@ inline bool Pipe(unique_fd_impl<Closer>* read, unique_fd_impl<Closer>* write,
                  int flags = O_CLOEXEC) {
   int pipefd[2];
 
-#if defined(__linux__)
   if (pipe2(pipefd, flags) != 0) {
     return false;
   }
-#else  // defined(__APPLE__)
-  if (flags & ~(O_CLOEXEC | O_NONBLOCK)) {
-    return false;
-  }
-  if (pipe(pipefd) != 0) {
-    return false;
-  }
-
-  if (flags & O_CLOEXEC) {
-    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) != 0) {
-      close(pipefd[0]);
-      close(pipefd[1]);
-      return false;
-    }
-  }
-  if (flags & O_NONBLOCK) {
-    if (fcntl(pipefd[0], F_SETFL, O_NONBLOCK) != 0 || fcntl(pipefd[1], F_SETFL, O_NONBLOCK) != 0) {
-      close(pipefd[0]);
-      close(pipefd[1]);
-      return false;
-    }
-  }
-#endif
 
   read->reset(pipefd[0]);
   write->reset(pipefd[1]);

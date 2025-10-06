@@ -1526,10 +1526,8 @@ int adb_commandline(int argc, const char** argv) {
     TransportType transport_type = kTransportAny;
     int ack_reply_fd = -1;
 
-#if !defined(_WIN32)
     // We'd rather have EPIPE than SIGPIPE.
     signal(SIGPIPE, SIG_IGN);
-#endif
 
     const char* server_host_str = nullptr;
     const char* server_port_str = nullptr;
