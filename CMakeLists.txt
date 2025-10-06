@@ -259,3 +259,24 @@ endif()
 target_include_directories(ziparchive PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+
+# Инсталляция adb
+set(CMAKE_INSTALL_PREFIX /opt)
+install(TARGETS adb
+    RUNTIME DESTINATION adb
+)
+
+# Установка динамических библиотек
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/lib/boringssl/lib/libssl.so
+    ${CMAKE_CURRENT_BINARY_DIR}/lib/boringssl/lib/libcrypto.so
+    ${CMAKE_CURRENT_BINARY_DIR}/ziparchive/libziparchive.so
+    DESTINATION adb/lib
+)
+
+# Настройка RPATH для автоматического поиска библиотек
+set_target_properties(adb PROPERTIES
+    BUILD_RPATH "$ORIGIN/lib"
+    INSTALL_RPATH "$ORIGIN/lib"
+)
