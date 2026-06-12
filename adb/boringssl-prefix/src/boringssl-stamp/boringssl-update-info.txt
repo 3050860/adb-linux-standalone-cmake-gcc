@@ -1,7 +1,0 @@
-# This is a generated file and its contents are an internal implementation detail.
-# The patch step will be re-executed if anything in this file changes.
-# No other meaning or use of this file is supported.
-
-command (connected)=/usr/bin/cmake;-Dcan_fetch=YES;-P;/home/nk/AndroidStudioProjects/adb-linux-standalone-cmake-gcc/adb/boringssl-prefix/tmp/boringssl-gitupdate.cmake
-command (disconnected)=/usr/bin/cmake;-Dcan_fetch=NO;-P;/home/nk/AndroidStudioProjects/adb-linux-standalone-cmake-gcc/adb/boringssl-prefix/tmp/boringssl-gitupdate.cmake
-work_dir=/home/nk/AndroidStudioProjects/adb-linux-standalone-cmake-gcc/adb/external/boringssl
