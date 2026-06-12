@@ -75,7 +75,7 @@ gid_t multiuser_get_ext_cache_gid(userid_t user_id, appid_t app_id) {
 gid_t multiuser_get_shared_gid(userid_t, appid_t app_id) {
     if (app_id >= AID_APP_START && app_id <= AID_APP_END) {
         return (app_id - AID_APP_START) + AID_SHARED_GID_START;
-    } else if (app_id >= AID_ROOT && app_id <= AID_APP_START) {
+    } else if (app_id <= AID_APP_START) {
         return app_id;
     } else {
         return -1;

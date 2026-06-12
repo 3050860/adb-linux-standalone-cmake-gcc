@@ -17,7 +17,9 @@
 
 
 #pragma once
+#ifndef __builtin_available
 #define __builtin_available(x,y) 0
+#endif
 
 #include <unistd.h>
 #include <sys/stat.h>
