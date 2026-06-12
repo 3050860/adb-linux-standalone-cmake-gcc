@@ -1351,6 +1351,7 @@ static adb::proto::ConnectionState adbStateFromProto(ConnectionState state) {
         case kCsRescue:
             return adb::proto::ConnectionState::RESCUE;
         case kCsAny:
+        default:
             return adb::proto::ConnectionState::ANY;
     }
 }
@@ -1450,6 +1451,7 @@ std::string list_transports(TrackerOutputType outputType) {
             return transportListToProto(sorted_transport_list, outputType == TEXT_PROTOBUF);
         }
     }
+    return "";
 }
 
 void close_usb_devices(std::function<bool(const atransport*)> predicate, bool reset) {
