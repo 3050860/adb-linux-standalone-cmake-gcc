@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2015 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #define TRACE_TAG ADB
 
 #include "adb_utils.h"
@@ -37,23 +21,9 @@
 #include "adb_trace.h"
 #include "sysdeps.h"
 
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include "windows.h"
-#  include "shlobj.h"
-#else
 #include <pwd.h>
-#endif
 
-
-#if defined(_WIN32)
-static constexpr char kNullFileName[] = "NUL";
-#else
 static constexpr char kNullFileName[] = "/dev/null";
-#endif
-
 void close_stdin() {
     int fd = unix_open(kNullFileName, O_RDONLY);
     if (fd == -1) {
@@ -232,8 +202,6 @@ std::string perror_str(const char* msg) {
     return android::base::StringPrintf("%s: %s", msg, strerror(errno));
 }
 
-#if !defined(_WIN32)
-// Windows version provided in sysdeps_win32.cpp
 bool set_file_block_mode(borrowed_fd fd, bool block) {
     int flags = fcntl(fd.get(), F_GETFL, 0);
     if (flags == -1) {
@@ -247,7 +215,6 @@ bool set_file_block_mode(borrowed_fd fd, bool block) {
     }
     return true;
 }
-#endif
 
 bool forward_targets_are_valid(const std::string& source, const std::string& dest,
                                std::string* error) {
@@ -273,19 +240,6 @@ bool forward_targets_are_valid(const std::string& source, const std::string& des
 }
 
 std::string adb_get_homedir_path() {
-#ifdef _WIN32
-    WCHAR path[MAX_PATH];
-    const HRESULT hr = SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, path);
-    if (FAILED(hr)) {
-        D("SHGetFolderPathW failed: %s", android::base::SystemErrorCodeToString(hr).c_str());
-        return {};
-    }
-    std::string home_str;
-    if (!android::base::WideToUTF8(path, &home_str)) {
-        return {};
-    }
-    return home_str;
-#else
     if (const char* const home = getenv("HOME")) {
         return home;
     }
@@ -304,7 +258,6 @@ std::string adb_get_homedir_path() {
 
     LOG(FATAL) << "failed to get user home directory";
     return {};
-#endif
 }
 
 std::string adb_get_android_dir_path() {
@@ -324,29 +277,9 @@ std::string GetLogFilePath() {
     const char* path = getenv("ANDROID_ADB_LOG_PATH");
     if (path) return path;
 
-#if defined(_WIN32)
-    const char log_name[] = "adb.log";
-    WCHAR temp_path[MAX_PATH];
-
-    // https://msdn.microsoft.com/en-us/library/windows/desktop/aa364992%28v=vs.85%29.aspx
-    DWORD nchars = GetTempPathW(arraysize(temp_path), temp_path);
-    if (nchars >= arraysize(temp_path) || nchars == 0) {
-        // If string truncation or some other error.
-        LOG(FATAL) << "cannot retrieve temporary file path: "
-                   << android::base::SystemErrorCodeToString(GetLastError());
-    }
-
-    std::string temp_path_utf8;
-    if (!android::base::WideToUTF8(temp_path, &temp_path_utf8)) {
-        PLOG(FATAL) << "cannot convert temporary file path from UTF-16 to UTF-8";
-    }
-
-    return temp_path_utf8 + log_name;
-#else
     const char* tmp_dir = getenv("TMPDIR");
     if (tmp_dir == nullptr) tmp_dir = "/tmp";
     return android::base::StringPrintf("%s/adb.%u.log", tmp_dir, getuid());
-#endif
 }
 
 [[noreturn]] static void error_exit_va(int error, const char* fmt, va_list va) {

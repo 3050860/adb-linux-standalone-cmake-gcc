@@ -14,24 +14,14 @@
  * limitations under the License.
  */
 
-#pragma once
+// #pragma once
 
-#include <optional>
-#include <string>
+// #include <optional>
+// #include <string>
 
-#include "adb.h"
+// #include "adb.h"
+// void adb_wifi_pair_device(const std::string& host, const std::string& password,
+//                           std::string& response);
+// bool adb_wifi_is_known_host(const std::string& host);
 
-#if ADB_HOST
 
-void adb_wifi_pair_device(const std::string& host, const std::string& password,
-                          std::string& response);
-bool adb_wifi_is_known_host(const std::string& host);
-
-#else  // !ADB_HOST
-
-struct AdbdAuthContext;
-
-void adbd_wifi_init(AdbdAuthContext* ctx);
-void adbd_wifi_secure_connect(atransport* t);
-
-#endif
