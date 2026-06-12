@@ -30,7 +30,6 @@
 
 #include "adb.h"
 #include "adb_auth.h"
-#include "adb_mdns.h"
 #include "adb_utils.h"
 #include "sysdeps.h"
 

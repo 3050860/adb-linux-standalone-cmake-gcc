@@ -39,11 +39,9 @@ set(SOURCES
     adb/adb.cpp
     adb/adb_io.cpp
     adb/adb_listeners.cpp
-    adb/adb_mdns.cpp
     adb/adb_trace.cpp
     adb/adb_unique_fd.cpp
     adb/adb_utils.cpp
-    adb/fdevent/fdevent.cpp
     adb/services.cpp
     adb/sockets.cpp
     adb/socket_spec.cpp
@@ -52,52 +50,35 @@ set(SOURCES
     adb/transport.cpp
     adb/transport_fd.cpp
     adb/types.cpp
+    adb/shell_service_protocol.cpp
 
     adb/sysdeps_unix.cpp
     adb/sysdeps/posix/network.cpp
 
+    adb/fdevent/fdevent.cpp
     adb/fdevent/fdevent_epoll.cpp
-
-    # adb/client/openscreen/mdns_service_info.cpp
-    # adb/client/openscreen/mdns_service_watcher.cpp
-    # adb/client/openscreen/platform/logging.cpp
-    # adb/client/openscreen/platform/task_runner.cpp
-    # adb/client/openscreen/platform/udp_socket.cpp
-
-    adb/client/auth.cpp
-    # adb/client/adb_wifi.cpp
-    # adb/client/usb_libusb.cpp
-    adb/client/transport_local.cpp
-    #adb/client/mdnsresponder_client.cpp
-    adb/client/mdns_utils.cpp
-    # adb/client/transport_mdns.cpp
-    # adb/client/transport_usb.cpp
-    # adb/client/pairing/pairing_client.cpp
-    adb/client/main.cpp
-    adb/client/adb_client.cpp
-    # adb/client/commandline.cpp
-    # adb/client/usb_linux.cpp
 
     adb/crypto/key.cpp
     adb/crypto/rsa_2048_key.cpp
     adb/crypto/x509_generator.cpp
+
     adb/tls/adb_ca_list.cpp
     adb/tls/tls_connection.cpp
 
+    adb/client/auth.cpp
+    adb/client/transport_local.cpp
+    adb/client/main.cpp
     adb/client/adb_client.cpp
     adb/client/bugreport.cpp
     adb/client/commandline.cpp
     adb/client/file_sync_client.cpp
-    adb/client/main.cpp
     adb/client/console.cpp
     adb/client/adb_install.cpp
     adb/client/line_printer.cpp
-    # adb/client/fastdeploy.cpp
-    # adb/client/fastdeploycallbacks.cpp
+
     adb/client/incremental.cpp
     adb/client/incremental_server.cpp
     adb/client/incremental_utils.cpp
-    adb/shell_service_protocol.cpp
 
 )
 # find_package(OpenSSL REQUIRED)
