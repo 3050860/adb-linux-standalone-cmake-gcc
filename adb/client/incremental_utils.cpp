@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2020 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #define TRACE_TAG INCREMENTAL
 
 #include "incremental_utils.h"
@@ -256,40 +240,10 @@ static std::vector<int32_t> ZipPriorityBlocks(off64_t signerBlockOffset, Size fi
 
 [[maybe_unused]] static ZipArchiveHandle openZipArchiveFd(borrowed_fd fd) {
     bool transferFdOwnership = false;
-#ifdef _WIN32
-    //
-    // Need to create a special CRT FD here as the current one is not compatible with
-    // normal read()/write() calls that libziparchive uses.
-    // To make this work we have to create a copy of the file handle, as CRT doesn't care
-    // and closes it together with the new descriptor.
-    //
-    // Note: don't move this into a helper function, it's better to be hard to reuse because
-    //       the code is ugly and won't work unless it's a last resort.
-    //
-    auto handle = adb_get_os_handle(fd);
-    HANDLE dupedHandle;
-    if (!::DuplicateHandle(::GetCurrentProcess(), handle, ::GetCurrentProcess(), &dupedHandle, 0,
-                           false, DUPLICATE_SAME_ACCESS)) {
-        D("%s failed at DuplicateHandle: %d", __func__, (int)::GetLastError());
-        return {};
-    }
-    int osfd = _open_osfhandle((intptr_t)dupedHandle, _O_RDONLY | _O_BINARY);
-    if (osfd < 0) {
-        D("%s failed at _open_osfhandle: %d", __func__, errno);
-        ::CloseHandle(handle);
-        return {};
-    }
-    transferFdOwnership = true;
-#else
     int osfd = fd.get();
-#endif
     ZipArchiveHandle zip;
     if (OpenArchiveFd(osfd, "apk_fd", &zip, transferFdOwnership) != 0) {
         D("%s failed at OpenArchiveFd: %d", __func__, errno);
-#ifdef _WIN32
-        // "_close()" is a secret WinCRT name for the regular close() function.
-        _close(osfd);
-#endif
         return {};
     }
     return zip;
