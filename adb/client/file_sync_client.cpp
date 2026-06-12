@@ -168,7 +168,7 @@ struct TransferLedger {
         if (now < last_progress_time + kProgressReportInterval) {
             return;
         }
-        char overall_percentage_str[5] = "?";
+        char overall_percentage_str[16] = "?";
         if (bytes_expected != 0 && bytes_transferred <= bytes_expected) {
             int overall_percentage = static_cast<int>(bytes_transferred * 100 / bytes_expected);
             // If we're pulling symbolic links, we'll pull the target of the link rather than

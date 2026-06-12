@@ -159,8 +159,6 @@ struct BrotliDecoder final : public Decoder {
             case BROTLI_DECODER_RESULT_SUCCESS:
                 // We need to wait for ID_DONE from the other end.
                 return finished_ ? DecodeResult::Done : DecodeResult::NeedInput;
-            case BROTLI_DECODER_RESULT_ERROR:
-                return DecodeResult::Error;
             case BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT:
                 // Brotli guarantees as one of its invariants that if it returns NEEDS_MORE_INPUT,
                 // it will consume the entire input buffer passed in, so we don't have to worry
@@ -168,6 +166,9 @@ struct BrotliDecoder final : public Decoder {
                 return DecodeResult::NeedInput;
             case BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT:
                 return DecodeResult::MoreOutput;
+            case BROTLI_DECODER_RESULT_ERROR:
+            default:
+                return DecodeResult::Error;
         }
     }
 

@@ -194,7 +194,7 @@ std::optional<Process> install(const Files& files, const Args& passthrough_args,
     auto pipe_write_fd_param = std::to_string(cast_handle_to_int(adb_get_os_handle(pipe_write_fd)));
     close_on_exec(pipe_read_fd);
 
-    std::vector<std::string> args(std::move(files));
+    std::vector<std::string> args(files);
     args.insert(args.begin(), {"inc-server", fd_param, pipe_write_fd_param});
     auto child =
             adb_launch_process(adb_path, std::move(args), {connection_fd.get(), pipe_write_fd});
