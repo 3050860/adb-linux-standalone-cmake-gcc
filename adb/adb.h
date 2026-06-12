@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2007 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #pragma once
 
 #include <limits.h>
@@ -151,28 +135,15 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, const char* o
 int init_socket_transport(atransport* t, unique_fd s, int port, int local);
 
 std::string getEmulatorSerialString(int console_port);
-#if ADB_HOST
+
 atransport* find_emulator_transport_by_adb_port(int adb_port);
 atransport* find_emulator_transport_by_console_port(int console_port);
-#endif
 
 unique_fd service_to_fd(std::string_view name, atransport* transport);
-#if !ADB_HOST
-unique_fd daemon_service_to_fd(std::string_view name, atransport* transport);
-#endif
 
-#if ADB_HOST
+
 asocket* host_service_to_socket(std::string_view name, std::string_view serial,
                                 TransportId transport_id);
-#endif
-
-#if !ADB_HOST
-asocket* daemon_service_to_socket(std::string_view name, atransport* transport);
-#endif
-
-#if !ADB_HOST
-unique_fd execute_abb_command(std::string_view command);
-#endif
 
 bool handle_forward_request(const char* service, atransport* transport, int reply_fd);
 bool handle_forward_request(const char* service,
@@ -214,15 +185,6 @@ extern const char* adb_device_banner;
 // Argument delimeter for adb abb command.
 #define ABB_ARG_DELIMETER ('\0')
 
-#if !ADB_HOST
-#define USB_FFS_ADB_PATH "/dev/usb-ffs/adb/"
-#define USB_FFS_ADB_EP(x) USB_FFS_ADB_PATH #x
-
-#define USB_FFS_ADB_EP0 USB_FFS_ADB_EP(ep0)
-#define USB_FFS_ADB_OUT USB_FFS_ADB_EP(ep1)
-#define USB_FFS_ADB_IN USB_FFS_ADB_EP(ep2)
-#endif
-
 enum class HostRequestResult {
     Handled,
     SwitchedTransport,
@@ -242,7 +204,6 @@ void send_ready(unsigned local, unsigned remote, atransport* t, uint32_t ack_byt
 
 void parse_banner(const std::string&, atransport* t);
 
-#if ADB_HOST
 // On startup, the adb server needs to wait until all of the connected devices are ready.
 // To do this, we need to know when the scan has identified all of the potential new transports, and
 // when each transport becomes ready.
@@ -260,6 +221,5 @@ void adb_wait_for_device_initialization();
 // When ssh-forwarding to a remote adb server, kill-server is almost never what you actually want,
 // and unfortunately, many other tools issue it. This adds a knob to reject kill-servers.
 void adb_set_reject_kill_server(bool reject);
-#endif
 
 void usb_init();
