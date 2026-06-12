@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2007 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #define TRACE_TAG SERVICES
 
 #include "sysdeps.h"
@@ -35,7 +19,6 @@
 #include "adb_io.h"
 #include "adb_unique_fd.h"
 #include "adb_utils.h"
-// #include "adb_wifi.h"
 #include "services.h"
 #include "socket_spec.h"
 #include "sysdeps.h"
@@ -59,15 +42,6 @@ unique_fd create_service_thread(const char* service_name, std::function<void(uni
     }
     D("socketpair: (%d,%d)", s[0], s[1]);
 
-#if !ADB_HOST
-    if (strcmp(service_name, "sync") == 0) {
-        // Set file sync service socket to maximum size
-        int max_buf = LINUX_MAX_SOCKET_SIZE;
-        adb_setsockopt(s[0], SOL_SOCKET, SO_SNDBUF, &max_buf, sizeof(max_buf));
-        adb_setsockopt(s[1], SOL_SOCKET, SO_SNDBUF, &max_buf, sizeof(max_buf));
-    }
-#endif  // !ADB_HOST
-
     std::thread(service_bootstrap_func, service_name, func, unique_fd(s[1])).detach();
 
     D("service thread started, %d:%d", s[0], s[1]);
@@ -82,10 +56,6 @@ unique_fd service_to_fd(std::string_view name, atransport* transport) {
         if (!socket_spec_connect(&ret, name, nullptr, nullptr, &error)) {
             LOG(ERROR) << "failed to connect to socket '" << name << "': " << error;
         }
-    } else {
-#if !ADB_HOST
-        ret = daemon_service_to_fd(name, transport);
-#endif
     }
 
     if (ret >= 0) {

@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2011 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #ifndef __TRANSPORT_H
 #define __TRANSPORT_H
 
@@ -327,21 +311,13 @@ class atransport : public enable_weak_from_this<atransport> {
     bool use_tls = false;
     int tls_version = A_STLS_VERSION;
     int get_tls_version() const;
-
-#if !ADB_HOST
-    // Used to provide the key to the framework.
-    std::string auth_key;
-    std::optional<uint64_t> auth_id;
-#endif
-
     bool IsTcpDevice() const { return type == kTransportLocal; }
 
-#if ADB_HOST
     // The current key being authorized.
     std::shared_ptr<RSA> Key();
     std::shared_ptr<RSA> NextKey();
     void ResetKeys();
-#endif
+
 
     char token[TOKEN_SIZE] = {};
     size_t failed_auth_attempts = 0;
@@ -367,10 +343,8 @@ class atransport : public enable_weak_from_this<atransport> {
     void RemoveDisconnect(adisconnect* disconnect);
     void RunDisconnects();
 
-#if ADB_HOST
     bool Attach(std::string* error);
     bool Detach(std::string* error);
-#endif
 
 #if ADB_HOST
     // Returns true if |target| matches this transport. A matching |target| can be any of:
@@ -490,10 +464,6 @@ void kick_all_transports();
 
 void kick_all_tcp_tls_transports();
 
-#if !ADB_HOST
-void kick_all_transports_by_auth_key(std::string_view auth_key);
-#endif
-
 void register_transport(atransport* transport);
 
 #if ADB_HOST
@@ -527,12 +497,6 @@ void send_packet(apacket* p, atransport* t);
 enum TrackerOutputType { SHORT_TEXT, LONG_TEXT, PROTOBUF, TEXT_PROTOBUF };
 asocket* create_device_tracker(TrackerOutputType type);
 std::string list_transports(TrackerOutputType type);
-#endif
-
-#if !ADB_HOST
-unique_fd adb_listen(std::string_view addr, std::string* error);
-void server_socket_thread(std::function<unique_fd(std::string_view, std::string*)> listen_func,
-                          std::string_view addr);
 #endif
 
 #endif /* __TRANSPORT_H */

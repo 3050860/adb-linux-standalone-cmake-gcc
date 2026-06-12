@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2016 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include "socket_spec.h"
 
 #include <limits>
@@ -38,17 +22,8 @@ using namespace std::string_literals;
 using android::base::ConsumePrefix;
 using android::base::StringPrintf;
 
-#if defined(__linux__)
 #define ADB_LINUX 1
-#else
-#define ADB_LINUX 0
-#endif
-
-#if defined(_WIN32)
-#define ADB_WINDOWS 1
-#else
 #define ADB_WINDOWS 0
-#endif
 
 #if ADB_LINUX
 #include <linux/vm_sockets.h>
@@ -63,12 +38,7 @@ struct LocalSocketType {
 };
 
 static auto& kLocalSocketTypes = *new std::unordered_map<std::string, LocalSocketType>({
-#if ADB_HOST
     { "local", { ANDROID_SOCKET_NAMESPACE_FILESYSTEM, !ADB_WINDOWS } },
-#else
-    { "local", { ANDROID_SOCKET_NAMESPACE_RESERVED, !ADB_WINDOWS } },
-#endif
-
     { "localreserved", { ANDROID_SOCKET_NAMESPACE_RESERVED, !ADB_HOST } },
     { "localabstract", { ANDROID_SOCKET_NAMESPACE_ABSTRACT, ADB_LINUX } },
     { "localfilesystem", { ANDROID_SOCKET_NAMESPACE_FILESYSTEM, !ADB_WINDOWS } },
@@ -140,9 +110,6 @@ int get_host_socket_spec_port(std::string_view spec, std::string* error) {
             errno = EINVAL;
             return -1;
         }
-#else   // ADB_LINUX
-        *error = "vsock is only supported on linux";
-        return -1;
 #endif  // ADB_LINUX
     } else {
         *error = "given socket spec string was invalid";
@@ -184,15 +151,6 @@ bool is_local_socket_spec(std::string_view spec) {
 
 bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std::string* serial,
                          std::string* error) {
-#if !ADB_HOST
-    if (!socket_access_allowed) {  // Check whether this security suppression is
-        // active (initiated from minadbd), and if so disable socket communications
-        // for the (min)deamon.
-        *error = "Suppressing minadbd socket communications";
-        return false;
-    }
-#endif
-
     if (address.starts_with("tcp:")) {
         std::string hostname;
         int port_value = port ? *port : 0;
@@ -222,10 +180,6 @@ bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std
             // } else {
                 fd->reset(network_connect(hostname, port_value, SOCK_STREAM, 0, error));
             // }
-#else
-            // Disallow arbitrary connections in adbd.
-            *error = "adbd does not support arbitrary tcp connections";
-            return false;
 #endif
         }
 
@@ -295,9 +249,6 @@ bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std
             *port = port_value;
         }
         return true;
-#else   // ADB_LINUX
-        *error = "vsock is only supported on Linux";
-        return false;
 #endif  // ADB_LINUX
     } else if (address.starts_with("acceptfd:")) {
         *error = "cannot connect to acceptfd";
@@ -344,11 +295,7 @@ int socket_spec_listen(std::string_view spec, std::string* error, int* resolved_
         }
 
         int result;
-#if ADB_HOST
         if (hostname.empty() && gListenAll) {
-#else
-        if (hostname.empty()) {
-#endif
             result = network_inaddr_any_server(port, SOCK_STREAM, error);
         } else if (tcp_host_is_local(hostname)) {
             result = network_loopback_server(port, SOCK_STREAM, error, true);
@@ -409,15 +356,8 @@ int socket_spec_listen(std::string_view spec, std::string* error, int* resolved_
             }
         }
         return serverfd.release();
-#else   // ADB_LINUX
-        *error = "vsock is only supported on linux";
-        return -1;
 #endif  // ADB_LINUX
     } else if (ConsumePrefix(&spec, "acceptfd:")) {
-#if ADB_WINDOWS
-        *error = "socket activation not supported under Windows";
-        return -1;
-#else
         // We inherited the socket from some kind of launcher. It's already bound and
         // listening. Return a copy of the FD instead of the FD itself so we implement the
         // normal "listen" contract and can succeed more than once.
@@ -452,7 +392,6 @@ int socket_spec_listen(std::string_view spec, std::string* error, int* resolved_
             return -1;
         }
         return new_fd;
-#endif
     }
 
     for (const auto& it : kLocalSocketTypes) {
