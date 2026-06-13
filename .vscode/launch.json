@@ -12,7 +12,7 @@
         "args": [],
         "stopAtEntry": false,
         "cwd": "${workspaceFolder}/build",
-        "environment": [],
+        "environment": [{"name": "ADB_TRACE", "value": "all"}],
         "externalConsole": false,
         "MIMode": "gdb",
         "setupCommands": [

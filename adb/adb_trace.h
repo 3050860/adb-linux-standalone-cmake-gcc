@@ -26,17 +26,14 @@ enum AdbTrace {
 };
 
 #define VLOG_IS_ON(TAG) \
-    ((adb_trace_mask & (1 << (TAG))) != 0)
+    (true)
 
 #define VLOG(TAG)                 \
-    if (LIKELY(!VLOG_IS_ON(TAG))) \
-        ;                         \
-    else                          \
         LOG(DEBUG)
 
 // You must define TRACE_TAG before using this macro.
 #define D(...) \
-    VLOG(TRACE_TAG) << android::base::StringPrintf(__VA_ARGS__)
+    VLOG(ADB) << android::base::StringPrintf(__VA_ARGS__)
 
 
 extern int adb_trace_mask;

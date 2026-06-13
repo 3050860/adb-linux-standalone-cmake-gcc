@@ -790,17 +790,6 @@ void kick_all_tcp_tls_transports() {
     }
 }
 
-#if !ADB_HOST
-void kick_all_transports_by_auth_key(std::string_view auth_key) {
-    std::lock_guard<std::recursive_mutex> lock(transport_lock);
-    for (auto t : transport_list) {
-        if (auth_key == t->auth_key) {
-            t->Kick();
-        }
-    }
-}
-#endif
-
 void register_transport(atransport* transport) {
     D("transport: %s registered", transport->serial.c_str());
     fdevent_run_on_looper([=]() { fdevent_register_transport(transport); });

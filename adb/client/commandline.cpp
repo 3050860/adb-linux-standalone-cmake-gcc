@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2007 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #define TRACE_TAG ADB
 
 #include "sysdeps.h"
@@ -43,13 +27,8 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 
-#if !defined(_WIN32)
 #include <sys/ioctl.h>
 #include <termios.h>
-#else
-#define _POSIX
-#include <signal.h>
-#endif
 
 #include <google/protobuf/text_format.h>
 
@@ -84,6 +63,7 @@ static void help() {
     fprintf(stdout, "%s\n", adb_version().c_str());
     // clang-format off
     fprintf(stdout,
+        "KVA\n"
         "global options:\n"
         " -a                       listen on all network interfaces, not just localhost\n"
         " -d                       use USB device (error if multiple devices connected)\n"
@@ -261,13 +241,6 @@ static void help() {
     // clang-format on
 }
 
-#if defined(_WIN32)
-
-// Implemented in sysdeps_win32.cpp.
-void stdin_raw_init();
-void stdin_raw_restore();
-
-#else
 static termios g_saved_terminal_state;
 
 static void stdin_raw_init() {
@@ -288,7 +261,6 @@ static void stdin_raw_init() {
 static void stdin_raw_restore() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_saved_terminal_state);
 }
-#endif
 
 int read_and_dump_protocol(borrowed_fd fd, StandardStreamsCallbackInterface* callback) {
     // OpenSSH returns 255 on unexpected disconnection.
@@ -348,41 +320,13 @@ int read_and_dump(borrowed_fd fd, bool use_shell_protocol,
 static void stdinout_raw_prologue(int inFd, int outFd, int& old_stdin_mode, int& old_stdout_mode) {
     if (inFd == STDIN_FILENO) {
         stdin_raw_init();
-#ifdef _WIN32
-        old_stdin_mode = _setmode(STDIN_FILENO, _O_BINARY);
-        if (old_stdin_mode == -1) {
-            PLOG(FATAL) << "could not set stdin to binary";
-        }
-#endif
     }
-
-#ifdef _WIN32
-    if (outFd == STDOUT_FILENO) {
-        old_stdout_mode = _setmode(STDOUT_FILENO, _O_BINARY);
-        if (old_stdout_mode == -1) {
-            PLOG(FATAL) << "could not set stdout to binary";
-        }
-    }
-#endif
 }
 
 static void stdinout_raw_epilogue(int inFd, int outFd, int old_stdin_mode, int old_stdout_mode) {
     if (inFd == STDIN_FILENO) {
         stdin_raw_restore();
-#ifdef _WIN32
-        if (_setmode(STDIN_FILENO, old_stdin_mode) == -1) {
-            PLOG(FATAL) << "could not restore stdin mode";
-        }
-#endif
     }
-
-#ifdef _WIN32
-    if (outFd == STDOUT_FILENO) {
-        if (_setmode(STDOUT_FILENO, old_stdout_mode) == -1) {
-            PLOG(FATAL) << "could not restore stdout mode";
-        }
-    }
-#endif
 }
 
 bool copy_to_file(int inFd, int outFd) {
