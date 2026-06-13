@@ -9,7 +9,7 @@ ExternalProject_Add(boringssl
     GIT_REPOSITORY "https://github.com/google/boringssl.git"
     GIT_TAG "0.20251002.0"
     SOURCE_DIR "${PROJECT_BINARY_DIR}/external/boringssl"
-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl -DCMAKE_CXX_FLAGS="-fPIC" -DBUILD_SHARED_LIBS=1
+    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl -DCMAKE_CXX_FLAGS="-fPIC" -DBUILD_SHARED_LIBS=1 -DBUILD_STATIC_LIBS=1
 )
 set(BORINGSSL_INCLUDE_DIRS ${PROJECT_BINARY_DIR}/lib/boringssl/include)
 set(BORINGSSL_LIBRARIES
@@ -84,16 +84,12 @@ set(SOURCES
 # find_package(OpenSSL REQUIRED)
 find_package(Protobuf REQUIRED)
 #find_package(PkgConfig REQUIRED)
-
 #pkg_check_modules(LIBBSD REQUIRED libbsd)
-
 #pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 pkg_check_modules(BROTLI REQUIRED libbrotlicommon libbrotlienc libbrotlidec)
 pkg_check_modules(LZ4 REQUIRED liblz4)
 pkg_check_modules(ZSTD REQUIRED libzstd)
-
 #include_directories(${LIBUSB_INCLUDE_DIRS})
-
 #message("LIBUSB_INCLUDE_DIRS: ${LIBUSB_INCLUDE_DIRS}")
 #message("LIBBSD_LIBRARIES: ${LIBBSD_LIBRARIES}")
 
@@ -119,9 +115,6 @@ add_custom_command(
     COMMENT "Generating protobuf files for ApkEntry.proto"
 )
 
-
-
-
 protobuf_generate_cpp(KEY_TYPE_PROTO_SRCS KEY_TYPE_PROTO_HDRS adb/proto/key_type.proto)
 protobuf_generate_cpp(DEVICES_PROTO DEVICES_PROTO_HDRS adb/proto/devices.proto)
 protobuf_generate_cpp(APP APP_HDRS adb/proto/app_processes.proto)
@@ -133,6 +126,7 @@ set(SOURCES ${SOURCES}
 )
 
 add_executable(adb ${SOURCES})
+
 target_compile_definitions(adb PRIVATE ANDROID_BASE_UNIQUE_FD_DISABLE_IMPLICIT_CONVERSION=1)
 target_include_directories(adb PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -143,9 +137,6 @@ target_include_directories(adb PRIVATE
     ${CMAKE_SOURCE_DIR}/adb/client   # client/*.h
     ${CMAKE_SOURCE_DIR}/system/libbase/include
     ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
-    # ${CMAKE_SOURCE_DIR}/external/openscreen/include
-    # ${CMAKE_SOURCE_DIR}/external/openscreen/platform/api
-    # ${CMAKE_SOURCE_DIR}/external/openscreen
     ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_BINARY_DIR}/lib/boringssl/include
 #    ${LIBBSD_INCLUDE_DIRS}
@@ -153,20 +144,9 @@ target_include_directories(adb PRIVATE
 add_subdirectory(libbuildversion build)
 add_subdirectory(system/core/diagnose_usb diagnose_usb)
 add_subdirectory(system/libbase base)
-
 add_subdirectory(system/libziparchive ziparchive)
-#add_subdirectory(third_party/boringssl/src)
 add_subdirectory(third_party/libcrypto_utils crypto_utils)
-# add_subdirectory(third_party/openscreen/src)
-# include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src/platform/api)
-# include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src)
-# include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src/discovery/dnssd/public)  # Для dnssd
 
-# Список исходников для libcutils
-file(GLOB LIBCUTILS_SOURCES1
-    "system/core/libcutils/*.c"
-    "system/core/libcutils/*.cpp"
-)
 set(LIBCUTILS_SOURCES
 system/core/libcutils/android_get_control_file.cpp
 system/core/libcutils/android_reboot.cpp
@@ -202,18 +182,16 @@ system/core/libcutils/uevent.cpp
 )
 # Создаем статическую библиотеку
 add_library(cutils STATIC ${LIBCUTILS_SOURCES})
-# Указываем директории с заголовками
+
 target_include_directories(cutils PRIVATE
     ${CMAKE_SOURCE_DIR}/system/libbase/include
     ${CMAKE_SOURCE_DIR}/system/liblog/include
     ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
 )
-# Определяем макросы для хоста
 target_compile_definitions(cutils PRIVATE
     -DADB_HOST=1
     -D_GLIBCXX_USE_CXX11_ABI=1
 )
-
 target_link_libraries(cutils base)
 
 add_subdirectory(system/liblog log)
@@ -221,14 +199,14 @@ add_subdirectory(system/core/libutils utils)
 
 target_link_libraries(adb PRIVATE
     ${BORINGSSL_LIBRARIES}
-    diagnose_usb crypto ssl crypto_utils build cutils ziparchive
+    diagnose_usb crypto ssl crypto_utils build cutils log ziparchive
 #    ${LIBUSB_LIBRARIES}
     ${Protobuf_LIBRARIES}
     ${BROTLI_LIBRARIES}
     ${LZ4_LIBRARIES}
     ${ZSTD_LIBRARIES}
 #    ${LIBBSD_LIBRARIES}
-)  # Линковка
+)
 target_include_directories(adb PRIVATE 
     ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
     ${CMAKE_SOURCE_DIR}/third_party/libcrypto_utils/include

@@ -30,9 +30,9 @@
 const char** __adb_argv;
 const char** __adb_envp;
 
-void init_spd_logger() {
-    android::base::LoggerHolder::get_logger();
-}
+// void init_spd_logger() {
+//     android::base::LoggerHolder::get_logger();
+// }
 
 
 static void setup_daemon_logging() {
@@ -183,12 +183,8 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, const char* o
 int main(int argc, char* argv[], char* envp[]) {
     __adb_argv = const_cast<const char**>(argv);
     __adb_envp = const_cast<const char**>(envp);
-    // init_spd_logger();
+
     adb_trace_init(argv);
-
-    PLOG(ERROR) << "test message";
-    LOG(INFO) << "info test message";
-    D("adb starting");
-
+    
     return adb_commandline(argc - 1, const_cast<const char**>(argv + 1));
 }
