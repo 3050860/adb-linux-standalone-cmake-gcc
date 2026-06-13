@@ -20,10 +20,31 @@ void AdbManager::start() {
     event_thread_ = std::thread(&AdbManager::eventLoopThread, this);
 }
 
+// void AdbManager::stop() {
+//     if (!is_running_) return;
+//     is_running_ = false;
+//     fdevent_terminate_loop(); // Прерывает fdevent_loop
+//     if (event_thread_.joinable()) {
+//         event_thread_.join();
+//     }
+// }
+
 void AdbManager::stop() {
     if (!is_running_) return;
+
+    // 1. Явно отключаем все устройства, пока fdevent_loop еще работает,
+    // а объекты-слушатели (например, переменная listener в main) еще валидны.
+    {
+        std::lock_guard<std::mutex> lock(devices_mutex_);
+        for (auto& pair : devices_) {
+            pair.second->close(); // Это корректно вызовет onConnectionStateChanged(Disconnected)
+        }
+        devices_.clear(); // Очищаем карту, чтобы ~AdbManager() не пытался делать это позже
+    }
+
+    // 2. Останавливаем цикл событий
     is_running_ = false;
-    fdevent_terminate_loop(); // Прерывает fdevent_loop
+    fdevent_terminate_loop();
     if (event_thread_.joinable()) {
         event_thread_.join();
     }

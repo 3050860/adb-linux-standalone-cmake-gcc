@@ -5,8 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include "adb.h"
- // Для create_local_socket, connect_to_remote
-#include "socket.h"
+#include "socket.h" // Для asocket, create_local_socket, connect_to_remote
 
 class AdbDevice;
 
@@ -16,11 +15,7 @@ public:
     ~AdbSession();
 
     uint32_t getId() const { return session_id_; }
-
-    // Запускает выполнение команды. Возвращает true, если команда успешно отправлена.
     bool start();
-
-    // Немедленно прерывает сессию (закрывает сокет, что вызывает разрыв цикла чтения)
     void abort();
 
 private:
@@ -32,7 +27,10 @@ private:
     
     unique_fd local_fd_;      // Наш конец socketpair для чтения
     unique_fd adb_fd_;        // Конец socketpair, переданный в ADB
-    std::shared_ptr<asocket> adb_socket_; // Обертка ADB над adb_fd_
+    
+    // ИСПРАВЛЕНИЕ: asocket удаляет себя сам (через local_socket_destroy).
+    // Мы не должны использовать shared_ptr, иначе будет double-free.
+    asocket* adb_socket_ = nullptr; 
     
     std::thread reader_thread_;
     std::atomic<bool> is_aborted_{false};

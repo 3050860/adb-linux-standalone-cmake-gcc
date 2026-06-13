@@ -33,7 +33,7 @@ endif()
 find_package(spdlog REQUIRED)
 find_package(fmt REQUIRED)
 
-add_compile_options(-Wall -Wextra -Wno-error -Wno-non-virtual-dtor -Wno-unknown-pragmas -Wno-attributes -Wno-unused-parameter -Wno-missing-field-initializers -Wvla -DADB_HOST=1 -D__linux__=1)
+add_compile_options(-g -O0 -Wall -Wextra -Wno-error -Wno-non-virtual-dtor -Wno-unknown-pragmas -Wno-attributes -Wno-unused-parameter -Wno-missing-field-initializers -Wvla -DADB_HOST=1 -D__linux__=1)
 
 set(SOURCES
     adb/adb.cpp
@@ -120,12 +120,61 @@ protobuf_generate_cpp(DEVICES_PROTO DEVICES_PROTO_HDRS adb/proto/devices.proto)
 protobuf_generate_cpp(APP APP_HDRS adb/proto/app_processes.proto)
 # protobuf_generate_cpp(FASTDEPLOY FASTDEPLOY_H adb/fastdeploy/profo)
 set(SOURCES ${SOURCES} 
-    ${APK_PROTO_SRCS} ${KEY_TYPE_PROTO_SRCS}
+    ${APK_PROTO_SRCS} 
+    ${KEY_TYPE_PROTO_SRCS}
     ${DEVICES_PROTO}
     ${APP}
 )
 set(ADIRECT_SOURCES
-    ${SOURCES}
+    adb/adb.cpp
+    adb/adb_io.cpp
+    adb/adb_listeners.cpp
+    adb/adb_trace.cpp
+    adb/adb_unique_fd.cpp
+    adb/adb_utils.cpp
+    adb/services.cpp
+    adb/sockets.cpp
+    adb/socket_spec.cpp
+    adb/sysdeps/env.cpp
+    adb/sysdeps/errno.cpp
+    adb/transport.cpp
+    adb/transport_fd.cpp
+    adb/types.cpp
+    adb/shell_service_protocol.cpp
+
+    adb/sysdeps_unix.cpp
+    adb/sysdeps/posix/network.cpp
+
+    adb/fdevent/fdevent.cpp
+    adb/fdevent/fdevent_epoll.cpp
+
+    adb/crypto/key.cpp
+    adb/crypto/rsa_2048_key.cpp
+    adb/crypto/x509_generator.cpp
+
+    adb/tls/adb_ca_list.cpp
+    adb/tls/tls_connection.cpp
+
+    adb/client/auth.cpp
+    adb/client/transport_local.cpp
+    
+    adb/client/adb_client.cpp
+    # adb/client/bugreport.cpp
+    # adb/client/commandline.cpp
+    # adb/client/file_sync_client.cpp
+    adb/client/console.cpp
+    # adb/client/adb_install.cpp
+    adb/client/line_printer.cpp
+
+    adb/client/incremental.cpp
+    adb/client/incremental_server.cpp
+    adb/client/incremental_utils.cpp
+
+    ${APK_PROTO_SRCS} 
+    ${KEY_TYPE_PROTO_SRCS}
+    ${DEVICES_PROTO}
+    ${APP}
+
     adb/lib/src/AdbDevice.cpp
     adb/lib/src/AdbManager.cpp
     adb/lib/src/AdbSession.cpp

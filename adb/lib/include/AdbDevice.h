@@ -4,7 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 #include "adb.h"
-#include "transport.h"
+#include "transport.h" // Для find_transport, connect_device
 #include "AdbSession.h"
 #include "IadbListener.h"
 
@@ -13,26 +13,27 @@ public:
     AdbDevice(const std::string& address, IDeviceListener* listener);
     ~AdbDevice();
 
-    // Инициирует TCP-подключение и регистрирует транспорт в ADB
     bool initiateConnection();
-
-    // Создает новую сессию (например, shell-команду)
     std::shared_ptr<AdbSession> createSession(const std::string& service_string);
-
-    // Принудительно закрывает соединение и все сессии
     void close();
 
-    const std::string& getSerial() const { return serial_; }
+    std::string getSerial() const { 
+        std::lock_guard<std::mutex> lock(serial_mutex_);
+        return serial_; 
+    }
 
-    // Вызывается изнутри ADB (через кастомный fdevent) при смене состояния
-    void notifyStateChanged(ConnectionState state);
-    void notifyAuthRequired();
     void notifyError(const std::string& msg);
 
+    // Безопасно получаем актуальный транспорт из глобального списка ADB
+    atransport* getTransport() {
+        std::lock_guard<std::mutex> lock(serial_mutex_);
+        return find_transport(serial_.c_str());
+    }
+
 private:
-    std::string serial_;
+    mutable std::mutex serial_mutex_;
+    std::string serial_; // Может измениться после connect_device (например, добавится порт)
     IDeviceListener* listener_;
-    std::shared_ptr<atransport> transport_;
     
     std::mutex sessions_mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<AdbSession>> sessions_;
