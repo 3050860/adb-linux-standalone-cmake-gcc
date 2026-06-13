@@ -19,16 +19,6 @@ void AdbManager::start() {
     is_running_ = true;
     event_thread_ = std::thread(&AdbManager::eventLoopThread, this);
 }
-
-// void AdbManager::stop() {
-//     if (!is_running_) return;
-//     is_running_ = false;
-//     fdevent_terminate_loop(); // Прерывает fdevent_loop
-//     if (event_thread_.joinable()) {
-//         event_thread_.join();
-//     }
-// }
-
 void AdbManager::stop() {
     if (!is_running_) return;
 

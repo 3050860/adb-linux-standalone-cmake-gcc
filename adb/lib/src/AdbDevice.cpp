@@ -85,17 +85,6 @@ void AdbDevice::close() {
     }
 }
 
-// void AdbDevice::close() {
-//     // Чтобы отключить устройство, мы можем использовать готовую функцию 
-//     // kick_transport или просто удалить его из списка, но для TCP проще 
-//     // вызвать host-запрос disconnect. 
-//     // В рамках концепта просто очистим сессии.
-//     std::lock_guard<std::mutex> lock(sessions_mutex_);
-//     sessions_.clear();
-    
-//     if (listener_) listener_->onConnectionStateChanged(getSerial(), ConnectionState::kCsDetached);
-// }
-
 void AdbDevice::notifyError(const std::string& msg) {
     if (listener_) listener_->onError(getSerial(), msg);
 }
