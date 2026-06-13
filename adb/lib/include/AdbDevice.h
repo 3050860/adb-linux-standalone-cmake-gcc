@@ -4,7 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 #include "adb.h"
-#include "transport.h" // Для find_transport, connect_device
+#include "transport.h"
 #include "AdbSession.h"
 #include "IadbListener.h"
 
@@ -14,13 +14,17 @@ public:
     ~AdbDevice();
 
     bool initiateConnection();
-    std::shared_ptr<AdbSession> createSession(const std::string& service_string);
+    std::shared_ptr<AdbSession> createSession(const std::string& service_string, bool use_shell2);
     void close();
 
     std::string getSerial() const { 
         std::lock_guard<std::mutex> lock(serial_mutex_);
         return serial_; 
     }
+
+    FeatureSet const getFeatures();
+    bool hasFeature(const std::string& feature);
+    std::shared_ptr<AdbSession> createShellSession(const std::string& command, bool force_raw=false);
 
     void notifyError(const std::string& msg);
 

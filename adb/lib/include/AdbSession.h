@@ -11,13 +11,15 @@ class AdbDevice;
 
 class AdbSession : public std::enable_shared_from_this<AdbSession> {
 public:
-    AdbSession(std::shared_ptr<AdbDevice> device, uint32_t session_id, const std::string& service_string);
+    AdbSession(std::shared_ptr<AdbDevice> device, uint32_t session_id, const std::string& service_string,
+                bool use_shell_v2);
     ~AdbSession();
 
     uint32_t getId() const { return session_id_; }
     bool start();
     void abort();
-
+    bool write2(const void* data, size_t length);
+    int getFd() const { return local_fd_.get(); }
 private:
     void readerThread();
 
@@ -34,4 +36,5 @@ private:
     
     std::thread reader_thread_;
     std::atomic<bool> is_aborted_{false};
+    bool use_shell_v2_;
 };

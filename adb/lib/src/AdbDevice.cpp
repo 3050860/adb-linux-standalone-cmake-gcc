@@ -9,6 +9,18 @@ AdbDevice::~AdbDevice() {
     close();
 }
 
+FeatureSet const AdbDevice::getFeatures() {
+    atransport* t = getTransport();
+    if (t) {
+        return t->features();
+    }
+    return FeatureSet();
+}
+
+bool AdbDevice::hasFeature(const std::string& feature) {
+    return CanUseFeature(getFeatures(), feature);
+}
+
 bool AdbDevice::initiateConnection() {
     if (listener_) listener_->onConnectionStateChanged(serial_, ConnectionState::kCsConnecting);
 
@@ -42,14 +54,14 @@ bool AdbDevice::initiateConnection() {
     return true; // Возвращаем true, чтобы показать, что процесс запущен
 }
 
-std::shared_ptr<AdbSession> AdbDevice::createSession(const std::string& service_string) {
+std::shared_ptr<AdbSession> AdbDevice::createSession(const std::string& service_string, bool use_shell2) {
     atransport* t = getTransport();
     if (!t) {
         if (listener_) listener_->onError(getSerial(), "Device not connected or transport lost");
         return nullptr;
     }
 
-    auto session = std::make_shared<AdbSession>(shared_from_this(), next_session_id_++, service_string);
+    auto session = std::make_shared<AdbSession>(shared_from_this(), next_session_id_++, service_string, use_shell2);
     registerSession(session);
     return session;
 }
@@ -87,4 +99,29 @@ void AdbDevice::close() {
 
 void AdbDevice::notifyError(const std::string& msg) {
     if (listener_) listener_->onError(getSerial(), msg);
+}
+
+/* ========================================================================================================= */
+
+std::shared_ptr<AdbSession> AdbDevice::createShellSession(const std::string& command, bool force_raw) {
+    std::string service_string = "shell:" + command;
+
+    // Если устройство поддерживает shell_v2, и мы не форсируем старый режим
+    if (!force_raw && hasFeature(kFeatureShell2)) {
+        // Формируем строку в стиле оригинального ADB: shell,v2,TERM=...,raw:command
+        const char* term = getenv("TERM");
+        std::string term_arg = term ? std::string("TERM=") + term : "";
+        
+        service_string = "shell,v2";
+        if (!term_arg.empty()) {
+            service_string += "," + term_arg;
+        }
+        service_string += ",raw:" + command;
+        
+        LOG(INFO) << "Upgrading shell command to v2 protocol: " << service_string;
+        return createSession(service_string, true);
+    } else {
+        LOG(INFO) << "Using legacy shell protocol for: " << service_string;
+        return createSession(service_string, false);
+    }
 }

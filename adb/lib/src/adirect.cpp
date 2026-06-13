@@ -110,13 +110,17 @@ int main(int argc, char* argv[], char* envp[]) {
     }
     std::cout << "Device connected successfully!" << std::endl;
 
+    if (device->hasFeature(kFeatureShell2)) {
+        std::cerr << "Device support shell protocol v2." << std::endl;
+    }
+
     // 5. Создаем сессию для выполнения команды
     // ВАЖНО: Используем "shell:" без ",v2", чтобы устройство слало просто текст, 
     // а не бинарный ShellProtocol. Иначе в консоли будет мусор.
-    std::string command = "shell:df -h /sdcard";
+    std::string command = "df -h /sdcard";
     std::cout << "\nExecuting command: " << command << "\n" << std::endl;
     
-    auto session = device->createSession(command);
+    auto session = device->createShellSession(command);
     if (!session) {
         std::cerr << "Failed to create session." << std::endl;
         manager.stop();
