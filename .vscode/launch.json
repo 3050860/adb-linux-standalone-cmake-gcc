@@ -8,7 +8,7 @@
         "name": "(gdb) Launch",
         "type": "cppdbg",
         "request": "launch",
-        "program": "${workspaceFolder}/build/adb",
+        "program": "${workspaceFolder}/build/adirect",
         "args": [],
         "stopAtEntry": false,
         "cwd": "${workspaceFolder}/build",

@@ -9,6 +9,7 @@
 #include "AdbManager.h"
 #include "AdbDevice.h"
 #include "AdbSession.h"
+#include "AdbFileSync.h"
 #include "IadbListener.h"
 
 
@@ -137,6 +138,23 @@ int main(int argc, char* argv[], char* envp[]) {
     // 7. Ждем завершения сессии (устройство само закроет соединение, когда команда выполнится)
     if (!listener.wait_for_session()) {
         std::cerr << "Session failed or timeout." << std::endl;
+    }
+
+    // 7. Push файла (использует ту же сессию устройства, не создает новое TCP-соединение)
+    AdbFileSync sservice(device);
+
+    std::cout << "\nPushing file to device..." << std::endl;
+    if (sservice.push({"/home/nk/apk/NetariumTV-release.apk"}, "/data/local/tmp/app.apk")) {
+        std::cout << "File pushed successfully!" << std::endl;
+    } else {
+        std::cerr << "Failed to push file." << std::endl;
+    }
+
+    std::cout << "\nPulling file from device..." << std::endl;
+    if (sservice.pull({"/data/local/tmp/app.apk"}, "/tmp/gotv2.apk")) {
+        std::cout << "File pushed successfully!" << std::endl;
+    } else {
+        std::cerr << "Failed to push file." << std::endl;
     }
 
     // 8. Корректно завершаем работу (останавливаем фоновый поток fdevent_loop)

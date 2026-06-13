@@ -20,7 +20,7 @@ AdbSession::~AdbSession() {
     }
 }
 
-bool AdbSession::start() {
+bool AdbSession::start(bool start_reader_thread) {
     atransport* t = device_->getTransport();
     if (!t) {
         device_->notifyError("Transport lost before session start");
@@ -69,8 +69,9 @@ bool AdbSession::start() {
     bool result = setup_future.get();
     
     if (result) {
-        // Запускаем поток чтения ТОЛЬКО после успешной регистрации сокета в ADB
-        reader_thread_ = std::thread(&AdbSession::readerThread, this);
+        if (start_reader_thread)
+            // Запускаем поток чтения ТОЛЬКО после успешной регистрации сокета в ADB
+            reader_thread_ = std::thread(&AdbSession::readerThread, this);
     }
 
     return result;
@@ -123,5 +124,5 @@ void AdbSession::readerThread() {
     if (device_->listener_) {
         device_->listener_->onSessionClosed(device_->getSerial(), session_id_, exit_code);
     }
-    device_->unregisterSession(session_id_);
+    // device_->unregisterSession(session_id_);
 }

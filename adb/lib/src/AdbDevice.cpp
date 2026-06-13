@@ -55,6 +55,14 @@ bool AdbDevice::initiateConnection() {
 }
 
 std::shared_ptr<AdbSession> AdbDevice::createSession(const std::string& service_string, bool use_shell2) {
+    // 1. Прерываем все активные сессии
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        for (auto& pair : sessions_) {
+            pair.second->abort();
+        }
+        sessions_.clear();
+    }
     atransport* t = getTransport();
     if (!t) {
         if (listener_) listener_->onError(getSerial(), "Device not connected or transport lost");

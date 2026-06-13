@@ -161,7 +161,8 @@ set(ADIRECT_SOURCES
     adb/client/adb_client.cpp
     # adb/client/bugreport.cpp
     # adb/client/commandline.cpp
-    # adb/client/file_sync_client.cpp
+    adb/lib/src/file_sync_client.cpp
+    adb/lib/src/helpers.cpp
     adb/client/console.cpp
     # adb/client/adb_install.cpp
     adb/client/line_printer.cpp
@@ -178,6 +179,7 @@ set(ADIRECT_SOURCES
     adb/lib/src/AdbDevice.cpp
     adb/lib/src/AdbManager.cpp
     adb/lib/src/AdbSession.cpp
+    adb/lib/src/AdbFileSync.cpp
     adb/lib/src/adirect.cpp
 )
 set(SOURCES ${SOURCES}

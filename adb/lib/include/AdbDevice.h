@@ -14,7 +14,7 @@ public:
     ~AdbDevice();
 
     bool initiateConnection();
-    std::shared_ptr<AdbSession> createSession(const std::string& service_string, bool use_shell2);
+    std::shared_ptr<AdbSession> createSession(const std::string& service_string, bool use_shell2=false);
     void close();
 
     std::string getSerial() const { 
