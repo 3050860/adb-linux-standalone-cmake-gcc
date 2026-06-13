@@ -67,7 +67,7 @@ set(SOURCES
 
     adb/client/auth.cpp
     adb/client/transport_local.cpp
-    adb/client/main.cpp
+    
     adb/client/adb_client.cpp
     adb/client/bugreport.cpp
     adb/client/commandline.cpp
@@ -123,6 +123,41 @@ set(SOURCES ${SOURCES}
     ${APK_PROTO_SRCS} ${KEY_TYPE_PROTO_SRCS}
     ${DEVICES_PROTO}
     ${APP}
+)
+set(ADIRECT_SOURCES
+    ${SOURCES}
+    adb/lib/src/AdbDevice.cpp
+    adb/lib/src/AdbManager.cpp
+    adb/lib/src/AdbSession.cpp
+    adb/lib/src/adirect.cpp
+)
+set(SOURCES ${SOURCES}
+    adb/client/main.cpp
+)
+add_executable(adirect ${ADIRECT_SOURCES})
+target_include_directories(adirect PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/adb
+    ${CMAKE_SOURCE_DIR}/adb/client
+    ${CMAKE_SOURCE_DIR}/adb/crypto/include
+    ${CMAKE_SOURCE_DIR}/adb/tls/include
+    ${CMAKE_SOURCE_DIR}/adb/client
+    ${CMAKE_SOURCE_DIR}/system/libbase/include
+    ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_BINARY_DIR}/lib/boringssl/include
+    ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
+    ${CMAKE_SOURCE_DIR}/third_party/libcrypto_utils/include
+    ${CMAKE_SOURCE_DIR}/system/libziparchive/include
+    ${CMAKE_SOURCE_DIR}/adb/lib/include
+)
+target_link_libraries(adirect PRIVATE
+    ${BORINGSSL_LIBRARIES}
+    diagnose_usb crypto ssl crypto_utils build cutils log ziparchive
+    ${Protobuf_LIBRARIES}
+    ${BROTLI_LIBRARIES}
+    ${LZ4_LIBRARIES}
+    ${ZSTD_LIBRARIES}
 )
 
 add_executable(adb ${SOURCES})
@@ -215,9 +250,12 @@ target_include_directories(adb PRIVATE
 
 if (NEED_LIBBSD)
     target_include_directories(adb PRIVATE ${LIBBSD_INCLUDE_DIRS})
+    target_include_directories(adirect PRIVATE ${LIBBSD_INCLUDE_DIRS})
     target_link_libraries(adb PRIVATE ${LIBBSD_LIBRARIES})
+    target_link_libraries(adirect PRIVATE ${LIBBSD_LIBRARIES})
 endif()
 target_link_libraries(adb PRIVATE spdlog::spdlog fmt::fmt)
+target_link_libraries(adirect PRIVATE spdlog::spdlog fmt::fmt)
 
 target_include_directories(ziparchive PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
