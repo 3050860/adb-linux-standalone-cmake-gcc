@@ -104,3 +104,9 @@ extern DefaultStandardStreamsCallback DEFAULT_STANDARD_STREAMS_CALLBACK;
 int send_shell_command(
         const std::string& command, bool disable_shell_protocol = false,
         StandardStreamsCallbackInterface* callback = &DEFAULT_STANDARD_STREAMS_CALLBACK);
+int read_and_dump(borrowed_fd fd, bool use_shell_protocol = false,
+                  StandardStreamsCallbackInterface* callback = &DEFAULT_STANDARD_STREAMS_CALLBACK);
+
+const std::optional<FeatureSet>& adb_get_feature_set_or_die(void);
+
+bool copy_to_file(int inFd, int outFd);

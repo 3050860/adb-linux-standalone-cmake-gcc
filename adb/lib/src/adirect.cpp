@@ -16,6 +16,7 @@
 #include "AdbDevice.h"
 #include "AdbSession.h"
 #include "AdbFileSync.h"
+#include "AdbInstaller.h"
 #include "IadbListener.h"
 
 const char** __adb_argv;
@@ -266,6 +267,46 @@ void run_pull(std::shared_ptr<AdbDevice> device, const std::vector<std::string>&
     }
 }
 
+void run_install(std::shared_ptr<AdbDevice> device, const std::vector<std::string>& args, Logger& log) {
+    std::vector<std::string> flags;
+    std::vector<std::string> paths;
+    
+    for (const auto& arg : args) {
+        if (arg.starts_with("-") || arg.starts_with("--")) {
+            flags.push_back(arg);
+        } else {
+            paths.push_back(arg);
+        }
+    }
+
+    if (paths.empty()) {
+        log.error("install requires at least one .apk or .apks path");
+        return;
+    }
+
+    log.info("Installing ", paths.size(), " package(s) with flags: ", android::base::Join(flags, " "));
+    AdbInstaller installer(device);
+    if (installer.install(paths, flags)) {
+        log.info("Installation successful");
+    } else {
+        log.error("Installation failed");
+    }
+}
+
+void run_uninstall(std::shared_ptr<AdbDevice> device, const std::vector<std::string>& args, Logger& log) {
+    if (args.empty()) {
+        log.error("uninstall requires a package name");
+        return;
+    }
+    log.info("Uninstalling ", android::base::Join(args, " "));
+    AdbInstaller installer(device);
+    if (installer.uninstall(args)) {
+        log.info("Uninstall successful");
+    } else {
+        log.error("Uninstall failed");
+    }
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -274,7 +315,7 @@ int main(int argc, char* argv[]) {
     __adb_envp = const_cast<const char**>(environ); // Убедись, что environ доступен
     adb_trace_init(argv);
 
-    std::string devices_file;
+    std::string devices_file = "devices.txt";
     
     static struct option long_options[] = {
         {"file", required_argument, 0, 'f'},
@@ -285,12 +326,18 @@ int main(int argc, char* argv[]) {
     int opt;
     while ((opt = getopt_long(argc, argv, "f:h", long_options, nullptr)) != -1) {
         switch (opt) {
-            case 'f': devices_file = optarg; break;
-            case 'h': print_help(); return 0;
-            default: print_help(); return 1;
+            case 'f': 
+                devices_file = optarg; // Если ключ -f передан, перезаписываем дефолтное значение
+                break;
+            case 'h': 
+                print_help(); 
+                return 0;
+            default: 
+                print_help(); 
+                return 1;
         }
     }
-    
+
     if (devices_file.empty()) {
         std::cerr << "Error: devices file (-f) is required\n";
         print_help();
@@ -341,6 +388,10 @@ int main(int argc, char* argv[]) {
                 run_push(device, cmd_args, log);
             } else if (command == "pull") {
                 run_pull(device, cmd_args, log);
+            } else if (command == "install") {
+                run_install(device, cmd_args, log);
+            } else if (command == "uninstall") {
+                run_uninstall(device, cmd_args, log);
             } else {
                 log.error("Unknown command: ", command);
             }

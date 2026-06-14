@@ -9,7 +9,12 @@
         "type": "cppdbg",
         "request": "launch",
         "program": "${workspaceFolder}/build/adirect",
-        "args": [],
+        "args": [
+            "-f",
+            "devices.txt",
+            "install",
+            "/home/nk/apk/rustore/okko-3.174.0.apks"
+        ],
         "stopAtEntry": false,
         "cwd": "${workspaceFolder}/build",
         "environment": [{"name": "ADB_TRACE", "value": "all"}],

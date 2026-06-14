@@ -133,3 +133,20 @@ std::shared_ptr<AdbSession> AdbDevice::createShellSession(const std::string& com
         return createSession(service_string, false);
     }
 }
+
+int AdbDevice::connectServiceSync(const std::string& service) {
+    auto session = createSession(service);
+    if (!session || !session->start(false)) {
+        return -1;
+    }
+    
+    // Сохраняем сессию, чтобы ADB не удалил asocket раньше времени
+    active_sessions_.push_back(session);
+    
+    // ОТДАЕМ ВЛАДЕНИЕ дескриптором вызывающему коду.
+    return session->releaseFd(); 
+}
+
+void AdbDevice::clearActiveSessions() {
+    active_sessions_.clear();
+}

@@ -17,6 +17,7 @@ public:
     ~AdbSession();
 
     uint32_t getId() const { return session_id_; }
+    int releaseFd() { return local_fd_.release(); }
     bool start(bool start_reader_thread = true);
     void abort();
     bool write2(const void* data, size_t length);
