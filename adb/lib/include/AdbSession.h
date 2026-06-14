@@ -4,6 +4,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <future>
 #include "adb.h"
 #include "socket.h" // Для asocket, create_local_socket, connect_to_remote
 
@@ -19,6 +20,7 @@ public:
     bool start(bool start_reader_thread = true);
     void abort();
     bool write2(const void* data, size_t length);
+    int wait();
     int getFd() const { return local_fd_.get(); }
 private:
     void readerThread();
@@ -37,4 +39,6 @@ private:
     std::thread reader_thread_;
     std::atomic<bool> is_aborted_{false};
     bool use_shell_v2_;
+    std::promise<int> exit_code_promise_;
+    std::future<int> exit_code_future_;
 };

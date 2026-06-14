@@ -11,13 +11,19 @@
 
 AdbSession::AdbSession(std::shared_ptr<AdbDevice> device, uint32_t session_id, const std::string& service_string,
                        bool use_shell_v2)
-    : device_(device), session_id_(session_id), service_string_(service_string), use_shell_v2_(use_shell_v2) {}
+    : device_(device), session_id_(session_id), service_string_(service_string), use_shell_v2_(use_shell_v2),
+      exit_code_future_(exit_code_promise_.get_future()) 
+      {}
 
 AdbSession::~AdbSession() {
     abort();
     if (reader_thread_.joinable()) {
         reader_thread_.join();
     }
+}
+
+int AdbSession::wait() {
+    return exit_code_future_.get();
 }
 
 bool AdbSession::start(bool start_reader_thread) {
@@ -123,6 +129,11 @@ void AdbSession::readerThread() {
 
     if (device_->listener_) {
         device_->listener_->onSessionClosed(device_->getSerial(), session_id_, exit_code);
+    }
+    try {
+        exit_code_promise_.set_value(exit_code);
+    } catch (...) {
+        // Игнорируем, если promise уже установлен
     }
     // device_->unregisterSession(session_id_);
 }

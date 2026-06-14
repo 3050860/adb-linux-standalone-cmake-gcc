@@ -1,10 +1,16 @@
-#define TRACE_TAG ADB
-
 #include <iostream>
+#include <fstream>
 #include <string>
+#include <vector>
+#include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <iomanip>
+#include <getopt.h>
+#include <android-base/strings.h>
+#include <android-base/file.h>
+#include "adb_utils.h"
 
 #include "AdbManager.h"
 #include "AdbDevice.h"
@@ -12,154 +18,342 @@
 #include "AdbFileSync.h"
 #include "IadbListener.h"
 
-
 const char** __adb_argv;
 const char** __adb_envp;
 
-class MyListener : public IDeviceListener {
+// ============================================================================
+// Потокобезопасный Логгер
+// ============================================================================
+class Logger {
 public:
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool connected = false;
-    bool session_done = false;
-    bool error_occurred = false;
+    static std::mutex global_mutex_;
+
+    Logger(const std::string& serial) : serial_(serial) {}
+
+    template<typename... Args>
+    void info(Args&&... args) {
+        log("INFO", std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    void error(Args&&... args) {
+        log("ERROR", std::forward<Args>(args)...);
+    }
+
+    // Специальный метод для вывода сырых данных shell с префиксом
+    void print_shell_line(const std::string& line) {
+        std::lock_guard<std::mutex> lock(global_mutex_);
+        print_prefix("SHELL");
+        std::cout << line << "\n";
+        std::cout.flush();
+    }
+
+private:
+    std::string serial_;
+
+    void print_prefix(const char* level) {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        
+        std::tm tm_buf;
+        localtime_r(&time_t, &tm_buf);
+        
+        std::cout << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") 
+                  << "." << std::setfill('0') << std::setw(3) << ms.count()
+                  << ":" << serial_ << ":" << level << ": ";
+    }
+
+    template<typename... Args>
+    void log(const char* level, Args&&... args) {
+        std::lock_guard<std::mutex> lock(global_mutex_);
+        print_prefix(level);
+        (std::cout << ... << args) << "\n";
+        std::cout.flush();
+    }
+};
+std::mutex Logger::global_mutex_;
+
+// ============================================================================
+// Слушатель событий для конкретного устройства
+// ============================================================================
+class DeviceListener : public IDeviceListener {
+public:
+    DeviceListener(Logger& log) : log_(log) {}
 
     void onConnectionStateChanged(const std::string& serial, ConnectionState state) override {
-        std::cout << "[STATE] " << serial << " -> state " << static_cast<int>(state) << std::endl;
         if (state == ConnectionState::kCsDevice) {
-            std::lock_guard<std::mutex> lock(mtx);
-            connected = true;
-            cv.notify_all();
+            std::lock_guard<std::mutex> lock(mtx_);
+            connected_ = true;
+            log_.info("Device connected");
+            cv_.notify_all();
         }
     }
 
     void onAuthRequired(const std::string& serial) override {
-        std::cout << "[AUTH] Please accept the RSA key on the device screen: " << serial << std::endl;
-        // Устройство запросило подтверждение ключа. Пользователь должен взять телефон и нажать "ОК".
+        log_.info("Auth required. Please accept RSA key on device screen.");
     }
 
     void onShellData(const std::string& serial, uint32_t session_id, const char* data, size_t len, bool is_stderr) override {
-        // Выводим сырые данные. Поскольку мы используем "shell:" без ",v2", это будет просто текст.
-        fwrite(data, 1, len, stdout);
-        fflush(stdout);
+        std::lock_guard<std::mutex> lock(shell_mtx_);
+        shell_buffer_.append(data, len);
+        
+        // Буферизуем вывод построчно, чтобы не ломать префиксы
+        size_t pos = 0;
+        while ((pos = shell_buffer_.find('\n')) != std::string::npos) {
+            std::string line = shell_buffer_.substr(0, pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back(); // Убираем \r
+            
+            log_.print_shell_line(line);
+            shell_buffer_.erase(0, pos + 1);
+        }
     }
 
     void onSessionClosed(const std::string& serial, uint32_t session_id, int exit_code) override {
-        std::cout << "\n[SESSION] Closed with exit code " << exit_code << std::endl;
-        std::lock_guard<std::mutex> lock(mtx);
-        session_done = true;
-        cv.notify_all();
+        // Достаем остаток буфера, если он есть
+        std::lock_guard<std::mutex> lock(shell_mtx_);
+        if (!shell_buffer_.empty()) {
+            if (!shell_buffer_.empty() && shell_buffer_.back() == '\r') shell_buffer_.pop_back();
+            log_.print_shell_line(shell_buffer_);
+            shell_buffer_.clear();
+        }
     }
 
     void onError(const std::string& serial, const std::string& error_msg) override {
-        std::cerr << "[ERROR] " << serial << ": " << error_msg << std::endl;
-        std::lock_guard<std::mutex> lock(mtx);
-        error_occurred = true;
-        connected = true;   // Разбудим wait_for_connection, чтобы он проверил флаг ошибки
-        session_done = true; // Разбудим wait_for_session
-        cv.notify_all();
-    }
-    
-    // Ждем подключения с таймаутом
-    bool wait_for_connection(int timeout_ms = 15000) {
-        std::unique_lock<std::mutex> lock(mtx);
-        bool result = cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]{ return connected || error_occurred; });
-        return result && connected && !error_occurred;
+        log_.error(error_msg);
+        std::lock_guard<std::mutex> lock(mtx_);
+        error_ = true;
+        cv_.notify_all();
     }
 
-    // Ждем завершения сессии с таймаутом
-    bool wait_for_session(int timeout_ms = 30000) {
-        std::unique_lock<std::mutex> lock(mtx);
-        bool result = cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]{ return session_done || error_occurred; });
-        return result && session_done && !error_occurred;
+    bool wait_for_device(int timeout_ms = 15000) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
+                            [this]{ return connected_ || error_; }) && connected_;
     }
+
+private:
+    Logger& log_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool connected_ = false;
+    bool error_ = false;
+
+    std::mutex shell_mtx_;
+    std::string shell_buffer_;
 };
 
-int main(int argc, char* argv[], char* envp[]) {
-    __adb_argv = const_cast<const char**>(argv);
-    __adb_envp = const_cast<const char**>(envp);
+// ============================================================================
+// Утилиты
+// ============================================================================
+std::vector<std::string> read_devices_file(const std::string& path) {
+    std::vector<std::string> devices;
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open devices file: " << path << "\n";
+        return devices;
+    }
 
+    std::string line;
+    while (std::getline(file, line)) {
+        // Trim
+        line.erase(0, line.find_first_not_of(" \t\r\n"));
+        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+        
+        if (line.empty() || line[0] == '#') continue;
+        
+        // Добавляем порт по умолчанию, если его нет
+        if (line.find(':') == std::string::npos) {
+            line += ":5555";
+        }
+        devices.push_back(line);
+    }
+    return devices;
+}
+
+void print_help() {
+    std::cout << "Usage: adirect -f <devices.txt> <command> [args...]\n"
+              << "Commands:\n"
+              << "  shell <command...>       Execute shell command on all devices\n"
+              << "  push <local> <remote>    Push file to all devices\n"
+              << "  pull <remote> <local>    Pull file from all devices\n"
+              << "Options:\n"
+              << "  -f, --file <path>        Path to file with device IPs (one per line)\n"
+              << "  -h, --help               Show this help\n";
+}
+
+// ============================================================================
+// Обработчики команд
+// ============================================================================
+void run_shell(std::shared_ptr<AdbDevice> device, const std::vector<std::string>& args, Logger& log) {
+    std::string cmd = android::base::Join(args, ' ');
+    log.info("Executing shell: ", cmd);
+    
+    auto session = device->createShellSession(cmd);
+    if (!session || !session->start()) {
+        log.error("Failed to start shell session");
+        return;
+    }
+    
+    int exit_code = session->wait();
+    log.info("Shell finished with exit code: ", exit_code);
+}
+
+void run_push(std::shared_ptr<AdbDevice> device, const std::vector<std::string>& args, Logger& log) {
+    if (args.size() != 2) {
+        log.error("push requires <local> <remote> arguments");
+        return;
+    }
+    std::string local = args[0];
+    std::string remote = args[1];
+    
+    log.info("Pushing ", local, " to ", remote);
+    AdbFileSync sync(device);
+    // quiet = true, чтобы SyncConnection не ломал многопоточный вывод своим прогресс-баром
+    if (sync.push({local}, remote, false, CompressionType::Any, true)) { 
+        log.info("Push successful");
+    } else {
+        log.error("Push failed");
+    }
+}
+
+void run_pull(std::shared_ptr<AdbDevice> device, const std::vector<std::string>& args, Logger& log) {
+    if (args.size() != 2) {
+        log.error("pull requires <remote_file> <local_dir> arguments");
+        return;
+    }
+    
+    std::string remote = args[0];
+    std::string local_dir = args[1];
+
+    // 1. Проверяем, что второй аргумент является существующей директорией
+    struct stat st;
+    if (stat(local_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        log.error("Second argument must be an existing directory: ", local_dir);
+        return;
+    }
+
+    // 2. Извлекаем IP-часть из serial (например, "192.168.177.248:5555" -> "192.168.177.248")
+    std::string serial = device->getSerial();
+    std::string ip_part = serial;
+    size_t colon_pos = serial.find(':');
+    if (colon_pos != std::string::npos) {
+        ip_part = serial.substr(0, colon_pos);
+    }
+
+    // 3. Формируем компоненты нового пути
+    std::string remote_filename = android::base::Basename(remote);
+    std::string target_subdir = local_dir + "/" + ip_part;
+    std::string target_filepath = target_subdir + "/" + remote_filename;
+
+    // 4. Создаем поддиректорию <local_dir>/<ip_part>, если её нет (аналог mkdir -p)
+    // Используем нативную функцию ADB mkdirs вместо CreateDirectories
+    if (!mkdirs(target_subdir)) {
+        log.error("Failed to create target directory: ", target_subdir);
+        return;
+    }
+
+    // 5. Выполняем pull, передавая сформированный полный путь к файлу
+    log.info("Pulling ", remote, " to ", target_filepath);
+    AdbFileSync sync(device);
+    
+    // Передаем target_filepath как dst. do_sync_pull корректно обработает это 
+    // как путь к конкретному файлу, так как srcs.size() == 1 и путь не заканчивается на '/'
+    if (sync.pull({remote}, target_filepath, false, CompressionType::None, true)) {
+        log.info("Pull successful");
+    } else {
+        log.error("Pull failed");
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+int main(int argc, char* argv[]) {
+    __adb_argv = const_cast<const char**>(argv);
+    __adb_envp = const_cast<const char**>(environ); // Убедись, что environ доступен
     adb_trace_init(argv);
 
-    // 1. Запускаем менеджер событий (fdevent_loop в фоне)
-    // Внутри AdbManager::start() автоматически вызывается adb_auth_init(), 
-    // который загружает RSA-ключи из ~/.android/adbkey.
+    std::string devices_file;
+    
+    static struct option long_options[] = {
+        {"file", required_argument, 0, 'f'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+    
+    int opt;
+    while ((opt = getopt_long(argc, argv, "f:h", long_options, nullptr)) != -1) {
+        switch (opt) {
+            case 'f': devices_file = optarg; break;
+            case 'h': print_help(); return 0;
+            default: print_help(); return 1;
+        }
+    }
+    
+    if (devices_file.empty()) {
+        std::cerr << "Error: devices file (-f) is required\n";
+        print_help();
+        return 1;
+    }
+    
+    if (optind >= argc) {
+        std::cerr << "Error: command is required (shell, push, pull)\n";
+        print_help();
+        return 1;
+    }
+    
+    std::string command = argv[optind];
+    std::vector<std::string> cmd_args(argv + optind + 1, argv + argc);
+    
+    auto devices = read_devices_file(devices_file);
+    if (devices.empty()) {
+        std::cerr << "Error: no devices found in " << devices_file << "\n";
+        return 1;
+    }
+    
     auto& manager = AdbManager::instance();
     manager.start();
-
-    // 2. Создаем слушатель
-    static MyListener listener;
-
-    // 3. Подключаемся к устройству
-    std::string address = "192.168.177.248:5555";
-    std::cout << "Connecting to " << address << "..." << std::endl;
     
-    auto device = manager.connectDevice(address, &listener);
-    if (!device) {
-        std::cerr << "Failed to initiate connection." << std::endl;
-        manager.stop();
-        return 1;
+    std::vector<std::thread> threads;
+    for (const auto& addr : devices) {
+        threads.emplace_back([&, addr]() {
+            Logger log(addr);
+            log.info("Connecting...");
+            
+            DeviceListener listener(log);
+            auto device = manager.connectDevice(addr, &listener);
+            if (!device) {
+                log.error("Failed to initiate connection");
+                return;
+            }
+            
+            if (!listener.wait_for_device()) {
+                log.error("Connection timeout or failed");
+                return;
+            }
+            
+            log.info("Connected successfully");
+            
+            if (command == "shell") {
+                run_shell(device, cmd_args, log);
+            } else if (command == "push") {
+                run_push(device, cmd_args, log);
+            } else if (command == "pull") {
+                run_pull(device, cmd_args, log);
+            } else {
+                log.error("Unknown command: ", command);
+            }
+            
+            manager.disconnectDevice(addr);
+            log.info("Disconnected");
+        });
     }
-
-    // 4. Ждем, пока устройство не перейдет в состояние Device
-    // (Это может занять несколько секунд, так как идет TCP-подключение и авторизация)
-    std::cout << "Waiting for connection (up to 15 seconds)..." << std::endl;
-    if (!listener.wait_for_connection()) {
-        std::cerr << "Connection failed, timeout, or error occurred." << std::endl;
-        manager.stop();
-        return 1;
-    }
-    std::cout << "Device connected successfully!" << std::endl;
-
-    if (device->hasFeature(kFeatureShell2)) {
-        std::cerr << "Device support shell protocol v2." << std::endl;
-    }
-
-    // 5. Создаем сессию для выполнения команды
-    // ВАЖНО: Используем "shell:" без ",v2", чтобы устройство слало просто текст, 
-    // а не бинарный ShellProtocol. Иначе в консоли будет мусор.
-    std::string command = "df -h /sdcard";
-    std::cout << "\nExecuting command: " << command << "\n" << std::endl;
     
-    auto session = device->createShellSession(command);
-    if (!session) {
-        std::cerr << "Failed to create session." << std::endl;
-        manager.stop();
-        return 1;
+    for (auto& t : threads) {
+        t.join();
     }
-
-    // 6. Запускаем сессию (отправляет пакет A_OPEN на устройство)
-    if (!session->start()) {
-        std::cerr << "Failed to start session." << std::endl;
-        manager.stop();
-        return 1;
-    }
-
-    // 7. Ждем завершения сессии (устройство само закроет соединение, когда команда выполнится)
-    if (!listener.wait_for_session()) {
-        std::cerr << "Session failed or timeout." << std::endl;
-    }
-
-    // 7. Push файла (использует ту же сессию устройства, не создает новое TCP-соединение)
-    AdbFileSync sservice(device);
-
-    std::cout << "\nPushing file to device..." << std::endl;
-    if (sservice.push({"/home/nk/apk/NetariumTV-release.apk"}, "/data/local/tmp/app.apk")) {
-        std::cout << "File pushed successfully!" << std::endl;
-    } else {
-        std::cerr << "Failed to push file." << std::endl;
-    }
-
-    std::cout << "\nPulling file from device..." << std::endl;
-    if (sservice.pull({"/data/local/tmp/app.apk"}, "/tmp/gotv2.apk")) {
-        std::cout << "File pushed successfully!" << std::endl;
-    } else {
-        std::cerr << "Failed to push file." << std::endl;
-    }
-
-    // 8. Корректно завершаем работу (останавливаем фоновый поток fdevent_loop)
+    
     manager.stop();
-    std::cout << "\nDone." << std::endl;
-
     return 0;
 }
