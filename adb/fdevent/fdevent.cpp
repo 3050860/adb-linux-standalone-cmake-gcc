@@ -132,6 +132,9 @@ std::optional<std::chrono::milliseconds> fdevent_context::CalculatePollDuration(
 }
 
 void fdevent_context::HandleEvents(const std::vector<fdevent_event>& events) {
+    if (events.size() > 1) {
+        LOG(INFO) << "[FDEVENT] HandleEvents: " << events.size() << " events ready";
+    }
     for (const auto& event : events) {
         // Verify the fde is still installed before invoking it.  It could have been unregistered
         // and destroyed inside an earlier event handler.

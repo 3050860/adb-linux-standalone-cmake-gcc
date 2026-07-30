@@ -1148,9 +1148,7 @@ size_t atransport::get_max_payload() const {
 
 #if ADB_HOST
 static bool delayed_ack_enabled() {
-    static const char* env = getenv("ADB_DELAYED_ACK");
-    static bool result = env && strcmp(env, "1") == 0;
-    return result;
+    return true;
 }
 #endif
 
