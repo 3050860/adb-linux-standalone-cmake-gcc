@@ -137,7 +137,6 @@ void fdevent_context::HandleEvents(const std::vector<fdevent_event>& events) {
         // and destroyed inside an earlier event handler.
         if (this->fdevent_set_.find(event.fde) != this->fdevent_set_.end()) {
             invoke_fde(event.fde, event.events);
-            break;
         }
     }
     FlushRunQueue();
