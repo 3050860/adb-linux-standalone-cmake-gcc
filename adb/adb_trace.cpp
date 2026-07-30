@@ -169,6 +169,8 @@ void adb_trace_init(char** argv) {
     }
 
     android::base::InitLogging(argv, &AdbLogger);
+    // Ensure LOG(INFO) messages pass through libbase filter to AdbLogger
+    android::base::SetMinimumLogSeverity(android::base::INFO);
     if (!log_tags.empty()) setenv("ANDROID_LOG_TAGS", log_tags.c_str(), 1);
     setup_trace_mask();
     VLOG(ADB) << adb_version();
