@@ -208,13 +208,16 @@ void run_push(std::shared_ptr<AdbDevice> device, const std::vector<std::string>&
     std::string local = args[0];
     std::string remote = args[1];
     
+    auto start_time = std::chrono::steady_clock::now();
     log.info("Pushing ", local, " to ", remote);
     AdbFileSync sync(device);
     // quiet = true, чтобы SyncConnection не ломал многопоточный вывод своим прогресс-баром
-    if (sync.push({local}, remote, false, CompressionType::Any, true)) { 
-        log.info("Push successful");
+    bool is_success = sync.push({local}, remote, false, CompressionType::Any, true);
+    long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
+    if (is_success) { 
+        log.info("Push successful, time: ", duration_ms ,"ms");
     } else {
-        log.error("Push failed");
+        log.error("Push failed, time: ", duration_ms ,"ms");
     }
 }
 
@@ -255,15 +258,19 @@ void run_pull(std::shared_ptr<AdbDevice> device, const std::vector<std::string>&
     }
 
     // 5. Выполняем pull, передавая сформированный полный путь к файлу
+
+    auto start_time = std::chrono::steady_clock::now();
     log.info("Pulling ", remote, " to ", target_filepath);
     AdbFileSync sync(device);
     
     // Передаем target_filepath как dst. do_sync_pull корректно обработает это 
     // как путь к конкретному файлу, так как srcs.size() == 1 и путь не заканчивается на '/'
-    if (sync.pull({remote}, target_filepath, false, CompressionType::None, true)) {
-        log.info("Pull successful");
+    bool is_success = sync.pull({remote}, target_filepath, false, CompressionType::None, true);
+    long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
+    if (is_success) {
+        log.info("Pull successful, time: ", duration_ms ,"ms");
     } else {
-        log.error("Pull failed");
+        log.error("Pull failed, time: ", duration_ms ,"ms");
     }
 }
 
@@ -284,12 +291,15 @@ void run_install(std::shared_ptr<AdbDevice> device, const std::vector<std::strin
         return;
     }
 
+    auto start_time = std::chrono::steady_clock::now();
     log.info("Installing ", paths.size(), " package(s) with flags: ", android::base::Join(flags, " "));
     AdbInstaller installer(device);
-    if (installer.install(paths, flags)) {
-        log.info("Installation successful");
+    bool is_success = installer.install(paths, flags);
+    long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
+    if (is_success) {
+        log.info("Installation successful, time: ", duration_ms ,"ms");
     } else {
-        log.error("Installation failed");
+        log.error("Installation failed, time: ", duration_ms ,"ms");
     }
 }
 
@@ -298,12 +308,15 @@ void run_uninstall(std::shared_ptr<AdbDevice> device, const std::vector<std::str
         log.error("uninstall requires a package name");
         return;
     }
+    auto start_time = std::chrono::steady_clock::now();
     log.info("Uninstalling ", android::base::Join(args, " "));
     AdbInstaller installer(device);
-    if (installer.uninstall(args)) {
-        log.info("Uninstall successful");
+    bool is_success = installer.uninstall(args);
+    long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
+    if (is_success) {
+        log.info("Uninstall successful, time: ", duration_ms ,"ms");
     } else {
-        log.error("Uninstall failed");
+        log.error("Uninstall failed, time: ", duration_ms ,"ms");
     }
 }
 
