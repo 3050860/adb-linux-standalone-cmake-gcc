@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(ADB)
+project(ADB VERSION 1.0.0)
 
 include(ExternalProject)
 ExternalProject_Add(boringssl
@@ -333,3 +333,89 @@ set_target_properties(adb PROPERTIES
     BUILD_RPATH "$ORIGIN/lib"
     INSTALL_RPATH "$ORIGIN/lib"
 )
+
+# ---------------------------------------------------------------------------
+# libadb.so — библиотека прямого управления устройствами
+#
+# adb_core  : STATIC (-fPIC) — весь код adb, кроме точек входа консольных
+#             клиентов (adirect.cpp / client/main.cpp).
+# adb_shared: SHARED — только фасад публичного API; наружу видны лишь
+#             символы libadb (см. adb/lib/libadb.map).
+#
+# Цели adb и adirect не затрагиваются: они по-прежнему собираются из своих
+# собственных списков исходников.
+# ---------------------------------------------------------------------------
+
+# Заголовок с версией
+configure_file(
+    ${CMAKE_SOURCE_DIR}/include/libadb/version.h.in
+    ${CMAKE_BINARY_DIR}/include/libadb/version.h
+    @ONLY
+)
+
+set(LIBADB_CORE_SOURCES ${ADIRECT_SOURCES})
+list(REMOVE_ITEM LIBADB_CORE_SOURCES adb/lib/src/adirect.cpp)
+
+add_library(adb_core STATIC ${LIBADB_CORE_SOURCES})
+add_dependencies(adb_core boringssl)
+set_target_properties(adb_core PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+target_include_directories(adb_core PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/adb
+    ${CMAKE_SOURCE_DIR}/adb/client
+    ${CMAKE_SOURCE_DIR}/adb/crypto/include
+    ${CMAKE_SOURCE_DIR}/adb/tls/include
+    ${CMAKE_SOURCE_DIR}/system/libbase/include
+    ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_BINARY_DIR}/lib/boringssl/include
+    ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
+    ${CMAKE_SOURCE_DIR}/third_party/libcrypto_utils/include
+    ${CMAKE_SOURCE_DIR}/system/libziparchive/include
+    ${CMAKE_SOURCE_DIR}/adb/lib/include
+)
+target_link_libraries(adb_core PUBLIC
+    ${BORINGSSL_LIBRARIES}
+    diagnose_usb crypto ssl crypto_utils build cutils log ziparchive
+    ${Protobuf_LIBRARIES}
+    ${BROTLI_LIBRARIES}
+    ${LZ4_LIBRARIES}
+    ${ZSTD_LIBRARIES}
+    spdlog::spdlog fmt::fmt
+    pthread dl
+)
+if (NEED_LIBBSD)
+    target_include_directories(adb_core PUBLIC ${LIBBSD_INCLUDE_DIRS})
+    target_link_libraries(adb_core PUBLIC ${LIBBSD_LIBRARIES})
+endif()
+
+set(LIBADB_API_SOURCES
+    adb/lib/src/api/globals.cpp
+    adb/lib/src/api/version.cpp
+    adb/lib/src/api/status.cpp
+    adb/lib/src/api/device_address.cpp
+)
+
+add_library(adb_shared SHARED ${LIBADB_API_SOURCES})
+set_target_properties(adb_shared PROPERTIES
+    OUTPUT_NAME adb
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+target_link_libraries(adb_shared PRIVATE adb_core)
+# Наружу — только то, что перечислено в version script.
+target_link_options(adb_shared PRIVATE
+    -Wl,--version-script=${CMAKE_SOURCE_DIR}/adb/lib/libadb.map
+    -Wl,--exclude-libs,ALL
+)
+set_target_properties(adb_shared PROPERTIES
+    LINK_DEPENDS ${CMAKE_SOURCE_DIR}/adb/lib/libadb.map
+)
+

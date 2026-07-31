@@ -69,3 +69,69 @@
 
 **Дальше:** этап 1 — разделение целей сборки (`adb_core` + `libadb.so`), генерация
 `include/libadb/version.h`, каркас публичных заголовков.
+
+---
+
+## Этап 1 — цели сборки и каркас API (`libadb-phase-1`)
+
+**Что сделано**
+
+Добавлены цели сборки, не затрагивающие существующие `adb` и `adirect`:
+
+- `adb_core` — STATIC, `POSITION_INDEPENDENT_CODE ON`, `CXX_VISIBILITY_PRESET hidden`.
+  Список исходников — это `ADIRECT_SOURCES` минус `adb/lib/src/adirect.cpp`
+  (`list(REMOVE_ITEM ...)`), поэтому набор кода библиотеки и `adirect` не разъезжается
+  при правках списка. Include-пути и зависимости объявлены `PUBLIC`.
+- `adb_shared` — SHARED, `OUTPUT_NAME adb` → `libadb.so.1.0.0` + симлинки
+  `libadb.so.1`, `libadb.so` (`VERSION`/`SOVERSION` из `PROJECT_VERSION`).
+  Содержит только файлы фасада из `adb/lib/src/api/`, `adb_core` подключён `PRIVATE`.
+
+`project(ADB)` → `project(ADB VERSION 1.0.0)`: без этого `PROJECT_VERSION*` пустые.
+`include/libadb/version.h.in` → `configure_file` → `${CMAKE_BINARY_DIR}/include/libadb/version.h`
+(`LIBADB_VERSION_MAJOR/MINOR/PATCH/STRING/NUMBER`). Сгенерированный `version.h` в
+репозиторий не попадает; IDE до первого запуска CMake ругается на его отсутствие — это
+нормально.
+
+Публичный заголовок `include/libadb/libadb.h`: включает только STL и `libadb/version.h`,
+`LIBADB_API` = `visibility("default")`. Реализованы `version()`, `version_number()`,
+`Status`, `Command`, `Phase` + три `to_string()`, `DeviceAddress`. Остальной API
+добавляется последующими этапами.
+
+`adb/lib/libadb.map` — version script: `global` = `libadb_*` (C ABI) и mangled-паттерны
+namespace `libadb` (`_ZN6libadb*`, `_ZNK6libadb*`, `_ZTIN/_ZTSN/_ZTVN6libadb*`),
+`local: *`. Дополнительно `-Wl,--exclude-libs,ALL`. Прописан `LINK_DEPENDS`, чтобы
+правка `.map` вызывала перелинковку.
+
+**Решения по ходу**
+
+1. `adirect` собирается из своих исходников и **не** линкуется с `adb_core`. Объекты
+   компилируются дважды, зато поведение `adirect` гарантированно не меняется (требование
+   спецификации). Сокращать дублирование — только после `examples/adirect2` (этап 16).
+2. `__adb_argv`/`__adb_envp` определены в `adirect.cpp` и `client/main.cpp`, а нужны
+   `adb_client.cpp` (перезапуск себя как adb-сервера через `execve`). Для `.so` добавлен
+   `adb/lib/src/api/globals.cpp` с определениями (`__adb_argv = {"libadb", nullptr}`,
+   `__adb_envp = nullptr`): в библиотеке этот путь не используется, но символы обязаны
+   существовать.
+3. `DeviceAddress::parse` возвращает `std::optional`: отвергает пустую строку, порт 0,
+   порт > 65535 и мусор после числа (`std::from_chars` + проверка `res.ptr`). Поддержан
+   IPv6 в скобках (`[::1]:5555`), поиск двоеточия — через `rfind`, поэтому
+   `192.168.1.10:5555` и `[::1]` не конфликтуют. `to_string()` подставляет скобки для
+   IPv6 обратно.
+4. `-Wl,--no-undefined` для `.so` пока не включается: на следующих этапах фасад начнёт
+   тянуть внутренности adb, и удобнее ловить недостающие символы разом. Отсутствие
+   неразрешённых символов проверяется `ldd -r`.
+
+**Что проверено**
+
+- `cmake ..` + `make adb_shared` — успешно; `libadb_core.a` 42 МБ, `libadb.so.1.0.0` 168 КБ.
+- `nm -D --defined-only libadb.so` — ровно 10 символов, все `libadb::*@@LIBADB_1.0`;
+  внутренностей adb/base/spdlog/protobuf наружу нет.
+- Внешняя программа (`g++ -Iinclude -Ibuild/include -ladb`) собирается и проходит
+  проверки: версия совпадает с заголовком, разбор адресов (`192.168.1.10` → `:5555`,
+  `[::1]:5555`), отказ на `host:0`, `host:99999`, `host:abc`, `""`, тексты статусов.
+- `ldd -r` по `libadb.so` и по тестовой программе — неразрешённых символов нет.
+- `make adirect adb` — обе цели собираются, `./adirect --help` работает как раньше.
+
+**Дальше:** этап 2 — подсистема логирования (`LogOptions`, `LogSink`, выключенный по
+умолчанию внутренний лог без создания `/tmp/adb.log`).
+

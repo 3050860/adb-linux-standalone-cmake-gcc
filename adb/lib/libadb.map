@@ -1,0 +1,18 @@
+/*
+ * Version script libadb.so.
+ * Экспортируется только публичный API: C ABI (libadb_*) и C++ namespace libadb.
+ * Всё остальное (внутренности adb, base, cutils, spdlog, protobuf) — local.
+ */
+LIBADB_1.0 {
+  global:
+    /* C ABI */
+    libadb_*;
+    /* C++ API: namespace libadb (функции, методы, typeinfo, vtable) */
+    _ZN6libadb*;
+    _ZNK6libadb*;
+    _ZTIN6libadb*;
+    _ZTSN6libadb*;
+    _ZTVN6libadb*;
+  local:
+    *;
+};
