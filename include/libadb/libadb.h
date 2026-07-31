@@ -9,12 +9,17 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
+
 
 
 #include "libadb/version.h"
@@ -175,5 +180,223 @@ LIBADB_API void flush_log();
 // логов приложения и библиотеки). Если sink не задан — вызов бесплатный.
 LIBADB_API void log(LogLevel level, const std::string& serial, std::string_view message);
 
+// ---------------------------------------------------------------------------
+// Колбэки операций
+// ---------------------------------------------------------------------------
+
+using ms = std::chrono::milliseconds;
+
+// total == 0 означает «размер неизвестен».
+using ProgressFn =
+    std::function<void(const std::string& serial, uint64_t done, uint64_t total)>;
+
+// Поток вывода shell/install по мере поступления.
+using OutputFn =
+    std::function<void(const std::string& serial, std::string_view chunk, bool is_stderr)>;
+
+// ---------------------------------------------------------------------------
+// Результат операции
+// ---------------------------------------------------------------------------
+
+// Сжатие полезной нагрузки при push/pull.
+// Any — выбрать лучшее из поддерживаемого устройством (обычно zstd/lz4).
+enum class Compression { None = 0, Any, Brotli, Lz4, Zstd };
+
+struct TransferStats {
+    uint64_t bytes = 0;          // передано полезных байт
+    uint64_t bytes_on_wire = 0;  // сколько реально ушло в сеть (после сжатия)
+    ms duration{0};              // время фазы передачи
+    double mib_per_sec = 0.0;    // средняя скорость
+};
+
+struct Result {
+    Status status = Status::Ok;
+    int exit_code = 0;         // shell / install / uninstall
+    std::string error;         // человекочитаемая причина
+    std::string remote_code;   // "INSTALL_FAILED_UPDATE_INCOMPATIBLE" и т.п.
+    std::string output;        // сырой вывод, если запрошен capture_output
+    Phase phase = Phase::None; // где закончили или сломались
+    int retries = 0;           // сколько было повторов
+    ms duration{0};            // полное время операции
+    TransferStats transfer;    // заполняется для push/pull
+
+    bool ok() const { return status == Status::Ok; }
+    explicit operator bool() const { return ok(); }
+};
+
+// ---------------------------------------------------------------------------
+// Опции отдельных операций
+// ---------------------------------------------------------------------------
+
+struct PushOptions {
+    Compression compression = Compression::Any;
+    bool sync_only_newer = false;  // как `adb push --sync`: пропускать совпадающие файлы
+    ProgressFn on_progress;
+};
+
+struct PullOptions {
+    Compression compression = Compression::None;
+    ProgressFn on_progress;
+};
+
+struct ShellOptions {
+    bool capture_output = true;  // складывать вывод в Result::output
+    OutputFn on_output;          // и/или отдавать его потоком
+};
+
+struct InstallOptions {
+    bool reinstall = true;             // -r
+    bool allow_downgrade = false;      // -d
+    bool grant_permissions = false;    // -g
+    std::vector<std::string> extra_args;  // всё остальное, дословно для `pm`
+    ProgressFn on_progress;            // прогресс заливки apk
+};
+
+struct UninstallOptions {
+    bool keep_data = false;  // -k
+};
+
+// ---------------------------------------------------------------------------
+// Настройки клиента
+// ---------------------------------------------------------------------------
+
+struct Options {
+    uint16_t default_port = 5555;   // подставляется, если в адресе нет порта
+    ms connect_timeout{15000};      // ожидание перехода устройства в состояние device
+    LogOptions log;                 // канал 1
+    LogSink log_sink;               // канал 2
+
+    // Ограничение параллелизма для групповых операций Client::for_each и *_all.
+    // 0 — без ограничения (поток на устройство).
+    size_t max_parallel = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Устройство
+// ---------------------------------------------------------------------------
+
+class Client;
+
+// Деталь реализации: фабрика, создающая Device (конструктор приватный).
+// Определена внутри библиотеки, приложению не нужна.
+namespace internal {
+struct DeviceFactory;
+}
+
+// Живое подключение к одному устройству. Создаётся только через Client.
+
+// Методы блокирующие; объект можно использовать из одного потока за раз.
+class LIBADB_API Device {
+  public:
+    ~Device();
+    Device(const Device&) = delete;
+    Device& operator=(const Device&) = delete;
+
+    // "192.168.1.10:5555"
+    const std::string& serial() const;
+
+    // Подключение живо и устройство в состоянии device.
+    bool is_online() const;
+
+    Result push(const std::string& local, const std::string& remote,
+                const PushOptions& options = {});
+    Result pull(const std::string& remote, const std::string& local,
+                const PullOptions& options = {});
+
+    // Выполняет команду и ждёт её завершения. exit_code — код возврата команды.
+    Result shell(const std::string& command, const ShellOptions& options = {});
+
+    Result install(const std::string& apk_path, const InstallOptions& options = {});
+    Result uninstall(const std::string& package, const UninstallOptions& options = {});
+
+    // getprop одним вызовом; std::nullopt, если свойство отсутствует.
+    std::optional<std::string> get_prop(const std::string& name);
+
+    // Закрывает подключение. Дальнейшие операции вернут Status::DeviceLost.
+    void close();
+
+    // PIMPL: определение живёт внутри библиотеки. Тип объявлен публично, чтобы
+    // внутренние помощники могли его называть, но создать Device всё равно
+    // может только Client (конструктор приватный).
+    struct Impl;
+
+  private:
+    friend class Client;
+    friend struct internal::DeviceFactory;
+    explicit Device(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+
+using DevicePtr = std::shared_ptr<Device>;
+
+// ---------------------------------------------------------------------------
+// Клиент
+// ---------------------------------------------------------------------------
+
+// Единая точка входа. Один экземпляр на процесс: внутренний event loop adb
+// глобален, поэтому Client — синглтон.
+class LIBADB_API Client {
+  public:
+    static Client& instance();
+
+    // Запускает event loop и применяет настройки. Повторный вызов только
+    // обновляет то, что можно менять на ходу (логи, таймауты, max_parallel).
+    Status initialize(const Options& options = {});
+    bool initialized() const;
+    const Options& options() const;
+
+    // Подключается к устройству и ждёт готовности (Options::connect_timeout).
+    // При ошибке возвращает nullptr, а причина попадает в *status (если задан).
+    DevicePtr connect(const DeviceAddress& address, Status* status = nullptr);
+    DevicePtr connect(const std::string& address, Status* status = nullptr);
+
+    // Групповая обработка: подключается к каждому адресу (не более max_parallel
+    // одновременно), вызывает task и закрывает подключение. Блокируется до конца.
+    // Если подключиться не удалось, task получает nullptr и статус ошибки.
+    void for_each(const std::vector<std::string>& addresses,
+                  const std::function<void(const DevicePtr& device, const std::string& address,
+                                           Status status)>& task);
+
+    // Те же операции сразу на списке устройств. Ключ результата — адрес из входного
+    // списка (не serial), чтобы вызывающий мог сопоставить с тем, что передал.
+    std::map<std::string, Result> push_all(const std::vector<std::string>& addresses,
+                                           const std::string& local, const std::string& remote,
+                                           const PushOptions& options = {});
+    std::map<std::string, Result> pull_all(const std::vector<std::string>& addresses,
+                                           const std::string& remote, const std::string& local_dir,
+                                           const PullOptions& options = {});
+    std::map<std::string, Result> shell_all(const std::vector<std::string>& addresses,
+                                            const std::string& command,
+                                            const ShellOptions& options = {});
+    std::map<std::string, Result> install_all(const std::vector<std::string>& addresses,
+                                              const std::string& apk_path,
+                                              const InstallOptions& options = {});
+    std::map<std::string, Result> uninstall_all(const std::vector<std::string>& addresses,
+                                                const std::string& package,
+                                                const UninstallOptions& options = {});
+
+    // Логирование: то же, что свободные функции, но через клиент.
+    void set_log_options(const LogOptions& options);
+    void set_log_level(LogLevel level);
+    void set_log_sink(LogSink sink);
+
+    // Закрывает все подключения; клиент остаётся работоспособным.
+    void close_all();
+
+    // Останавливает event loop. После этого initialize() можно вызвать снова.
+    void shutdown();
+
+  private:
+    Client();
+    ~Client();
+    Client(const Client&) = delete;
+    Client& operator=(const Client&) = delete;
+
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace libadb
+
 

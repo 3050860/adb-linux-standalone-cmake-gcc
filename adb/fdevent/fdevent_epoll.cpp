@@ -92,7 +92,12 @@ void fdevent_context_epoll::Set(fdevent* fde, unsigned events) {
 }
 
 void fdevent_context_epoll::Loop() {
+    // Сбрасываем флаг остановки: libadb позволяет остановить event loop
+    // (Client::shutdown) и снова запустить его (Client::initialize), а без
+    // сброса повторный Loop() вышел бы сразу же на первой проверке.
+    terminate_loop_ = false;
     looper_thread_id_ = android::base::GetThreadId();
+
 
     std::vector<fdevent_event> fde_events;
     std::unordered_map<fdevent*, fdevent_event*> event_map;

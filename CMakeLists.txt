@@ -400,7 +400,10 @@ set(LIBADB_API_SOURCES
     adb/lib/src/api/status.cpp
     adb/lib/src/api/device_address.cpp
     adb/lib/src/api/log.cpp
+    adb/lib/src/api/device.cpp
+    adb/lib/src/api/client.cpp
 )
+
 
 add_library(adb_shared SHARED ${LIBADB_API_SOURCES})
 target_include_directories(adb_shared PRIVATE ${CMAKE_SOURCE_DIR}/adb/lib/src)

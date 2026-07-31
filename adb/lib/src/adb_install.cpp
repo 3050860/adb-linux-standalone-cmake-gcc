@@ -59,7 +59,25 @@ static bool is_abb_exec_supported() {
     return CanUseFeature(*features, kFeatureAbbExec);
 }
 
+// Приёмник статусных строк pm для текущего потока (см. adb_install_lib.h).
+static thread_local std::string* g_status_sink = nullptr;
+
+void adb_install_set_status_sink(std::string* sink) {
+    g_status_sink = sink;
+}
+
+// Пишет статусную строку в приёмник, если он установлен, иначе — в поток
+// процесса (прежнее поведение adirect).
+static void report_status(FILE* stream, const char* text) {
+    if (g_status_sink) {
+        g_status_sink->append(text);
+        return;
+    }
+    fputs(text, stream);
+}
+
 static int pm_command(int argc, const char** argv) {
+
     std::string cmd = "pm";
 
     while (argc-- > 0) {
@@ -227,13 +245,14 @@ static int install_app_streamed(int argc, const char** argv, bool use_fastdeploy
     char buf[BUFSIZ];
     read_status_line(remote_fd.get(), buf, sizeof(buf));
     if (strncmp("Success", buf, 7) != 0) {
-        fprintf(stderr, "adb: failed to install %s: %s", file, buf);
+        report_status(stderr, buf);
         return 1;
     }
 
-    fputs(buf, stdout);
+    report_status(stdout, buf);
     return 0;
 }
+
 
 static int install_app_legacy(int argc, const char** argv, bool use_fastdeploy) {
     printf("Performing Push Install\n");
@@ -577,13 +596,13 @@ static int install_multiple_app_streamed(int argc, const char** argv) {
         }
     }
     if (session_id < 0) {
-        fprintf(stderr, "adb: failed to create session\n");
-        fputs(buf, stderr);
+        report_status(stderr, buf);
         return EXIT_FAILURE;
     }
     const auto session_id_str = std::to_string(session_id);
 
     // Valid session, now stream the APKs
+
     bool success = true;
     for (int i = first_apk; i < argc; i++) {
         const char* file = argv[i];
@@ -628,11 +647,11 @@ static int install_multiple_app_streamed(int argc, const char** argv) {
         read_status_line(remote_fd.get(), buf, sizeof(buf));
 
         if (strncmp("Success", buf, 7)) {
-            fprintf(stderr, "adb: failed to write \"%s\"\n", file);
-            fputs(buf, stderr);
+            report_status(stderr, buf);
             success = false;
             goto finalize_session;
         }
+
     }
 
 finalize_session:
@@ -653,14 +672,14 @@ finalize_session:
     if (!success) return EXIT_FAILURE;
 
     if (strncmp("Success", buf, 7)) {
-        fprintf(stderr, "adb: failed to finalize session\n");
-        fputs(buf, stderr);
+        report_status(stderr, buf);
         return EXIT_FAILURE;
     }
 
-    fputs(buf, stdout);
+    report_status(stdout, buf);
     return EXIT_SUCCESS;
 }
+
 
 int install_multiple_app(int argc, const char** argv) {
     InstallMode install_mode = INSTALL_DEFAULT;

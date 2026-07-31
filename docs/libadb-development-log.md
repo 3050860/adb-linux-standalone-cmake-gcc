@@ -201,3 +201,59 @@ namespace `libadb` (`_ZN6libadb*`, `_ZNK6libadb*`, `_ZTIN/_ZTSN/_ZTVN6libadb*`),
 - `nm -D` на `.so`: 16 символов, все `libadb::*`, `internal::` — 0.
 - Регрессия `adirect`: `ADB_TRACE=all ./adirect --help` пишет `/tmp/adb.log` как раньше;
   `adb`, `adirect`, `adb_shared` собираются без ошибок.
+
+## Этап 3 — Client и Device (синхронный путь)
+
+**Что сделано**
+
+- `include/libadb/libadb.h`: `Client` (синглтон: `initialize/connect/for_each/shutdown`),
+  `Device` (`push/pull/shell/install/uninstall/get_prop/serial/is_online/close`),
+  `Result` (`status/phase/exit_code/remote_code/output/error/duration/transfer`).
+- `adb/lib/src/api/client.cpp` — жизненный цикл `AdbManager`, подключение по адресу,
+  повторное подключение после `close()`.
+- `adb/lib/src/api/device.cpp` — реализация операций, `FacadeListener` (мост
+  `IAdbDeviceListener` -> `Result`/логи/колбэки вывода).
+
+**Найдено и исправлено при проверке на живых устройствах (192.168.177.248/249)**
+
+1. `uninstall` был холостым: путь `uninstall_app()` из кода adb опирается на
+   `send_shell_command()`, которая в этой сборке — заглушка, поэтому удаление
+   «успешно» завершалось, ничего не удаляя. Теперь `Device::uninstall` выполняет
+   `cmd package uninstall` (с откатом на `pm uninstall`, если `cmd` нет) через
+   обычный shell-канал и разбирает текст ответа.
+2. Fallback через `||` оказался вреден: `cmd package uninstall` печатает `Success`,
+   но может вернуть ненулевой код, и тогда запускался ещё и `pm uninstall`, чей
+   `Failure [DELETE_FAILED_INTERNAL_ERROR]` затирал успех. Инструмент выбирается
+   заранее (`command -v cmd`), а решающим признаком считается `Success`.
+3. `remote_code` был пустым: код искали по префиксу `INSTALL_FAILED`, а pm печатает
+   `Failure [CODE]`/`Failure [CODE: описание]`. Разбор переписан на этот формат —
+   ловятся и `INSTALL_PARSE_FAILED_*`, и `DELETE_FAILED_*`.
+4. Библиотека писала в stdout приложения: статусные строки pm печатались через
+   `fputs(buf, stdout)` в `adb_install.cpp`. Добавлен `adb_install_set_status_sink()`
+   (thread_local) — `Device::install` собирает их в `Result::output`, а `adirect`
+   (sink не установлен) печатает как раньше.
+
+**Что проверено**
+
+- `connect`/`shell`/`push`/`pull`/`for_each`, повторное подключение после `close()`.
+- `install` существующего apk: `Ok`, `output` содержит `Success`, ~15.6 с на 60 МБ apk.
+- Битый apk: `RemoteError` + `INSTALL_PARSE_FAILED_NOT_APK`.
+- `uninstall` несуществующего пакета: `RemoteError` + `DELETE_FAILED_INTERNAL_ERROR` (~0.1–0.9 с).
+- `uninstall` реального пакета: пакет исчезает из `pm list packages -3`, повторный
+  `install` возвращает его назад.
+- Тест: `test/auto/test_011_install_uninstall.cpp` — ALL PASSED на 249 и 248.
+
+**Важное предупреждение по стенду**
+
+Удаление `cs.netarium` (это и есть `test/main.apk`) увело устройство 192.168.177.248
+из сети примерно на пять минут — приложение, судя по поведению, отвечает за
+сетевой/kiosk-режим. Устройство вернулось само, пакет установлен обратно. Поэтому
+`test_011` намеренно не удаляет уже установленные пакеты: проверка `uninstall`
+ограничена несуществующим пакетом.
+
+**Что осталось (этапы 4+)**
+
+- `bytes_on_wire` в `Result::transfer` всегда 0: внутренний `SyncConnection` не
+  сообщает объём после сжатия.
+- Прогресс-бар sync отключён (`quiet=true`), т.к. писал в stdout; свой прогресс —
+  вместе с событиями (§8).
