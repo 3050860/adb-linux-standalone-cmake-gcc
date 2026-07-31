@@ -31,58 +31,129 @@ static spdlog::level::level_enum MapSeverity(android::base::LogSeverity severity
     }
 }
 
-// 2. Функция для получения (и ленивой инициализации) логгера.
-// Гарантирует, что логгер создастся только один раз, даже при многопоточном вызове.
-static std::shared_ptr<spdlog::logger>& GetFileLogger() {
-    static std::shared_ptr<spdlog::logger> logger;
-    static std::once_flag init_flag;
+// 2. Конфигурируемый файловый логгер.
+//
+// Настройки задаются через adb_log_configure(); по умолчанию действуют значения
+// AdbLogSettings (историческое поведение adb/adirect), кроме enabled — он берётся
+// из adb_log_default_enabled(), и в libadb.so это false.
+//
+// Пока лог выключен, файл не открывается и не создаётся: sink конструируется
+// лениво, при первой фактической записи.
 
-    std::call_once(init_flag, []() {
-        // Создаем ротируемый sink: макс размер файла 5 МБ, храним 3 старых файла
-        auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            LOG_FILE_PATH, 
-            1024 * 1024 * 5, // 5 MB
-            3                // max files
-        );
-        
-        logger = std::make_shared<spdlog::logger>("adb_file_logger", sink);
-        
-        // Настраиваем формат вывода. 
-        // %Y-%m-%d %H:%M:%S.%e - время, %^%l%$ - цветной уровень (в консоли, в файле будет текст), %v - сообщение
-        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%t] %v");
-        
-        // Устанавливаем минимальный уровень (например, ловим даже VERBOSE)
-        logger->set_level(spdlog::level::trace);
-        
-        // Автоматически сбрасывать буфер на диск при ошибках и выше
-        logger->flush_on(spdlog::level::debug);
-    });
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
 
-    return logger;
+namespace {
+
+std::mutex g_log_mutex;
+std::shared_ptr<spdlog::logger> g_logger;
+bool g_logger_dirty = true;
+
+// Настройки живут в куче и намеренно не удаляются: логировать могут статические
+// деструкторы, и порядок уничтожения глобалов не должен приводить к обращению
+// к мёртвому объекту.
+AdbLogSettings& LogSettingsLocked() {
+    static AdbLogSettings* settings = [] {
+        auto* s = new AdbLogSettings();
+        s->enabled = adb_log_default_enabled();
+        return s;
+    }();
+    return *settings;
 }
 
-// 3. Ваша обновленная функция AdbLogger
+// Возвращает логгер или nullptr, если лог выключен. Вызывать под g_log_mutex.
+std::shared_ptr<spdlog::logger> GetFileLoggerLocked() {
+    AdbLogSettings& s = LogSettingsLocked();
+    if (!s.enabled) return nullptr;
+    if (g_logger && !g_logger_dirty) return g_logger;
+
+    try {
+        auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                s.file_path, s.max_file_size, s.max_files);
+        auto logger = std::make_shared<spdlog::logger>("adb_file_logger", std::move(sink));
+        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%t] %v");
+        logger->set_level(spdlog::level::trace);
+        logger->flush_on(spdlog::level::debug);
+        g_logger = std::move(logger);
+        g_logger_dirty = false;
+    } catch (const std::exception& e) {
+        // Путь недоступен (нет прав, нет каталога). Процесс не роняем:
+        // выключаем лог и работаем дальше.
+        fprintf(stderr, "adb: cannot open log file %s: %s\n", s.file_path.c_str(), e.what());
+        s.enabled = false;
+        g_logger.reset();
+        g_logger_dirty = true;
+    }
+    return g_logger;
+}
+
+}  // namespace
+
+// Слабое определение: adb и adirect пишут в файл, как раньше. libadb.so
+// переопределяет этот символ (adb/lib/src/api/globals.cpp) и отключает лог.
+__attribute__((weak)) bool adb_log_default_enabled() {
+    return true;
+}
+
+void adb_log_configure(const AdbLogSettings& settings) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    AdbLogSettings& current = LogSettingsLocked();
+    const bool reopen = !settings.enabled || current.file_path != settings.file_path ||
+                        current.max_file_size != settings.max_file_size ||
+                        current.max_files != settings.max_files;
+    current = settings;
+    if (reopen) {
+        g_logger.reset();
+        g_logger_dirty = true;
+    }
+}
+
+AdbLogSettings adb_log_current_settings() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return LogSettingsLocked();
+}
+
+void adb_log_open(const char* reason) {
+    std::shared_ptr<spdlog::logger> logger;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        logger = GetFileLoggerLocked();
+    }
+    if (!logger) return;
+    logger->info("--- log opened: {} ---", reason ? reason : "");
+    logger->flush();
+}
+
+void adb_log_flush() {
+
+    std::shared_ptr<spdlog::logger> logger;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        logger = g_logger;
+    }
+    if (logger) logger->flush();
+}
+
+// 3. Приёмник сообщений libbase: LOG()/VLOG() -> файловый лог.
 void AdbLogger(android::base::LogId id, android::base::LogSeverity severity,
                const char* tag, const char* file, unsigned int line,
                const char* message) {
-    
-    // Получаем наш инициализированный логгер
-    auto& logger = GetFileLogger();
-    
-    // Преобразуем уровень
-    auto spd_level = MapSeverity(severity);
-    
-    // Формируем итоговое сообщение. 
-    // Переменная 'message' уже содержит текст от LOG/PLOG. 
-    // Мы можем добавить к нему имя файла и строку для удобства отладки.
-    std::string formatted_msg = message ? message : "";
-    
-    // Если вы хотите, чтобы в файле было видно, из какого файла пришла строка:
-    logger->log(spd_level, "[{}:{}] [{}] {}", 
-                file ? file : "unknown", 
-                line, 
-                tag ? tag : "GLOBAL", 
-                formatted_msg);
+    std::shared_ptr<spdlog::logger> logger;
+    bool also_stderr = false;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        logger = GetFileLoggerLocked();
+        also_stderr = LogSettingsLocked().also_stderr;
+    }
+
+    if (also_stderr) {
+        android::base::StderrLogger(id, severity, tag, file, line, message);
+    }
+    if (!logger) return;
+
+    logger->log(MapSeverity(severity), "[{}:{}] [{}] {}", file ? file : "unknown", line,
+                tag ? tag : "GLOBAL", message ? message : "");
 }
 
 

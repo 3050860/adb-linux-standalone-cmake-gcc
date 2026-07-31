@@ -135,3 +135,69 @@ namespace `libadb` (`_ZN6libadb*`, `_ZNK6libadb*`, `_ZTIN/_ZTSN/_ZTVN6libadb*`),
 **Дальше:** этап 2 — подсистема логирования (`LogOptions`, `LogSink`, выключенный по
 умолчанию внутренний лог без создания `/tmp/adb.log`).
 
+
+---
+
+## Этап 2 — логирование (`libadb-phase-2`)
+
+**Что сделано**
+
+Внутренний файловый лог `adb_trace.cpp` стал конфигурируемым. Раньше он был жёстко
+зашит: `/tmp/adb.log`, ротация 5 МБ × 3, `once_flag`, и файл создавался при первой же
+записи в любом процессе. Теперь есть `AdbLogSettings` + `adb_log_configure()`,
+`adb_log_open()`, `adb_log_flush()`, `adb_log_current_settings()`; `AdbLogger()` вынесен
+в заголовок (нужен фасаду для `InitLogging`).
+
+Публичный API (`include/libadb/libadb.h`): `LogLevel`, `LogOptions`, `LogSink`,
+`set_log_options()`, `log_options()`, `set_log_level()`, `set_log_sink()`, `flush_log()`,
+`log()`. Реализация — `adb/lib/src/api/log.cpp`, внутренние помощники —
+`adb/lib/src/api/internal.h` (`ensure_logging_initialized`, `emit_log`, `log_sink_wants`).
+
+`include/libadb/spdlog_sink.hpp` — header-only адаптер `make_spdlog_sink()`; в `.so`
+не входит, компилируется у приложения его собственной версией spdlog.
+
+**Решения по ходу**
+
+1. **Выключение лога по умолчанию — через weak-символ, а не через статический
+   инициализатор.** `adb_trace.cpp` содержит
+   `__attribute__((weak)) bool adb_log_default_enabled() { return true; }`, а
+   `api/globals.cpp` — сильное определение, возвращающее `false`. Линкер выбирает
+   strong, поэтому в `libadb.so` лог выключен с самого первого возможного `LOG()`,
+   независимо от порядка инициализации глобалов, а `adb`/`adirect` получают прежнее
+   поведение (проверено `nm`: в `adirect` символ `W`, в `.so` — сильное определение).
+   Вариант с конструктором глобального объекта отвергнут: чужой статический
+   инициализатор мог бы залогировать раньше и создать файл.
+2. `LogSettingsLocked()` держит настройки в куче и намеренно не удаляет их: логировать
+   могут статические деструкторы, и обращение к уничтоженному объекту недопустимо.
+3. Открытие sink остаётся ленивым, но `set_log_options(enabled = true)` сразу пишет
+   строку-маркер `--- log opened: ... ---`: включение лога должно быть видно на диске
+   немедленно, иначе непонятно, заработало ли оно.
+4. Недоступный путь (нет прав/каталога) не роняет процесс: сообщение в stderr,
+   `enabled = false`, работа продолжается.
+5. При выключенном логе `SetMinimumLogSeverity(FATAL)` — внутренние `LOG()/VLOG()` не
+   тратят время на форматирование строк. При включённом — уровень из `LogOptions::level`.
+6. `ADB_TRACE` как аварийный override применяется при загрузке `.so` (объект
+   `TraceEnvBootstrap`, объявлен последним в TU, поэтому `g_mutex`/`g_options` уже
+   инициализированы). Если переменная не задана, конструктор ничего не делает и файл
+   не создаётся.
+7. `libadb::internal::*` попадает под шаблон `_ZN6libadb*` в version script, поэтому
+   помечен `visibility("hidden")` явно — иначе внутренние помощники утекли бы в ABI.
+8. `set_log_*` пока свободные функции (глобальные на процесс): `Client` появится на
+   этапе 3 и его `set_log_options/set_log_level/set_log_sink` будут делегировать сюда.
+9. Уровень `LogSink` (`g_sink_level`) пока фиксирован `Trace` — фильтрация канала 2
+   отдельной настройкой появится вместе с событиями (§8).
+
+**Что проверено**
+
+- Лог выключен по умолчанию: ни `/tmp/adb.log`, ни заданный путь не создаются
+  (`test -e` — absent).
+- `set_log_options(enabled=true, file_path=/tmp/libadb-test.log)` — файл появляется
+  сразу, с маркером `--- log opened: libadb::set_log_options ---`; `/tmp/adb.log`
+  по-прежнему не создаётся.
+- `ADB_TRACE=all` без единого вызова API включает лог (`--- log opened: ADB_TRACE ---`).
+- `LogSink`: сообщение доходит с уровнем и serial; `LogLevel::Off` отбрасывается.
+- `make_spdlog_sink` компилируется у приложения и пишет
+  `[warning] [192.168.1.7:5555] via spdlog sink`.
+- `nm -D` на `.so`: 16 символов, все `libadb::*`, `internal::` — 0.
+- Регрессия `adirect`: `ADB_TRACE=all ./adirect --help` пишет `/tmp/adb.log` как раньше;
+  `adb`, `adirect`, `adb_shared` собираются без ошибок.

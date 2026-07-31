@@ -40,4 +40,49 @@ extern int adb_trace_mask;
 void adb_trace_init(char**);
 void adb_trace_enable(AdbTrace trace_tag);
 
+// ---------------------------------------------------------------------------
+// Конфигурация файлового лога.
+//
+// Консольные клиенты (adb, adirect) ничего не настраивают и получают
+// историческое поведение: /tmp/adb.log, ротация 5 МБ × 3.
+// libadb.so переопределяет adb_log_default_enabled() (см. lib/src/api/globals.cpp)
+// и выключает лог по умолчанию: файл не открывается и не создаётся.
+// ---------------------------------------------------------------------------
+
+struct AdbLogSettings {
+    bool enabled = true;
+    std::string file_path = "/tmp/adb.log";
+    size_t max_file_size = 5 * 1024 * 1024;
+    size_t max_files = 3;
+    bool also_stderr = false;
+    // Минимальный уровень: android::base::LogSeverity как int
+    // (VERBOSE=0 ... FATAL). Значение по умолчанию соответствует VERBOSE,
+    // фильтрация выше делается через SetMinimumLogSeverity.
+    int min_severity = 0;
+};
+
+// Значение enabled по умолчанию. Слабый символ: adb/adirect получают true,
+// libadb.so — false.
+bool adb_log_default_enabled();
+
+// Применяет настройки. Существующий логгер закрывается, новый файл открывается
+// лениво — при первой записи.
+void adb_log_configure(const AdbLogSettings& settings);
+
+AdbLogSettings adb_log_current_settings();
+
+// Форсирует открытие файла и пишет строку-маркер. Нужен, чтобы включение лога
+// было сразу видно на диске, не дожидаясь первого LOG().
+void adb_log_open(const char* reason);
+
+// Сбрасывает буферы на диск (если лог включён).
+void adb_log_flush();
+
+
+// Приёмник сообщений libbase (передаётся в android::base::InitLogging).
+void AdbLogger(android::base::LogId id, android::base::LogSeverity severity, const char* tag,
+               const char* file, unsigned int line, const char* message);
+
+
+
 #endif /* __ADB_TRACE_H */
