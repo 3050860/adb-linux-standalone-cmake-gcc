@@ -210,13 +210,12 @@ static bool local_socket_flush_outgoing(asocket* s) {
             if (s->available_send_bytes) {
                 if (*s->available_send_bytes <= 0) {
                     D("LS(%u): send buffer full (%" PRId64 ")", saved_id, *s->available_send_bytes);
-                    LOG(INFO) << "[FLOW] LS(" << saved_id << ") BLOCKED: delayed_ack, available=" << *s->available_send_bytes;
                     fdevent_del(s->fde, FDE_READ);
                 }
             } else {
                 D("LS(%u): acks not deferred, blocking", saved_id);
-                LOG(INFO) << "[FLOW] LS(" << saved_id << ") BLOCKED: waiting for ACK (no delayed_ack)";
                 fdevent_del(s->fde, FDE_READ);
+
             }
         }
     }
@@ -414,14 +413,13 @@ void local_socket_ack(asocket* s, std::optional<int32_t> acked_bytes) {
         // This can't (reasonably) overflow: available_send_bytes is 64-bit.
         *s->available_send_bytes += *acked_bytes;
         if (*s->available_send_bytes > 0) {
-            LOG(INFO) << "[FLOW] LS(" << s->id << ") UNBLOCKED: delayed_ack, available=" << *s->available_send_bytes;
             s->ready(s);
         }
     } else {
         D("LS(%d) received ack", s->id);
-        LOG(INFO) << "[FLOW] LS(" << s->id << ") UNBLOCKED: got ACK";
         s->ready(s);
     }
+
 }
 
 asocket* create_local_socket(unique_fd ufd) {

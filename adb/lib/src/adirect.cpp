@@ -178,10 +178,19 @@ void print_help() {
               << "  shell <command...>       Execute shell command on all devices\n"
               << "  push <local> <remote>    Push file to all devices\n"
               << "  pull <remote> <local>    Pull file from all devices\n"
+              << "  install [flags] <apk...> Install package(s) on all devices\n"
+              << "  uninstall <package...>   Uninstall package(s) from all devices\n"
               << "Options:\n"
               << "  -f, --file <path>        Path to file with device IPs (one per line)\n"
-              << "  -h, --help               Show this help\n";
+              << "  -j, --max-threads <n>    Max devices processed simultaneously (default: 0 = all).\n"
+              << "                           Next device from the file is connected only after\n"
+              << "                           a worker thread becomes free.\n"
+              << "  -h, --help               Show this help\n"
+              << "Environment:\n"
+              << "  ADB_TRACE=all            Full trace log (VERBOSE) into /tmp/adb.log\n"
+              << "                           (also: adb,sockets,packets,sync,transport,fdevent,...)\n";
 }
+
 
 // ============================================================================
 // Обработчики команд
@@ -329,19 +338,33 @@ int main(int argc, char* argv[]) {
     adb_trace_init(argv);
 
     std::string devices_file = "devices.txt";
-    
+    size_t max_threads = 0;  // 0 = без ограничения
+
     static struct option long_options[] = {
         {"file", required_argument, 0, 'f'},
+        {"max-threads", required_argument, 0, 'j'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "f:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "f:j:h", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'f': 
                 devices_file = optarg; // Если ключ -f передан, перезаписываем дефолтное значение
                 break;
+            case 'j': {
+                char* end = nullptr;
+                long value = strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || value < 0) {
+                    std::cerr << "Error: --max-threads expects a non-negative number, got '"
+                              << optarg << "'\n";
+                    print_help();
+                    return 1;
+                }
+                max_threads = static_cast<size_t>(value);
+                break;
+            }
             case 'h': 
                 print_help(); 
                 return 0;
@@ -350,6 +373,7 @@ int main(int argc, char* argv[]) {
                 return 1;
         }
     }
+
 
     if (devices_file.empty()) {
         std::cerr << "Error: devices file (-f) is required\n";
@@ -373,51 +397,58 @@ int main(int argc, char* argv[]) {
     }
     
     auto& manager = AdbManager::instance();
+    // Ограничение параллелизма живёт в AdbManager, поэтому действует для всех команд.
+    manager.setMaxThreads(max_threads);
     manager.start();
-    
-    std::vector<std::thread> threads;
-    for (const auto& addr : devices) {
-        threads.emplace_back([&, addr]() {
-            Logger log(addr);
-            log.info("Connecting...");
-            
-            DeviceListener listener(log);
-            auto device = manager.connectDevice(addr, &listener);
-            if (!device) {
-                log.error("Failed to initiate connection");
-                return;
-            }
-            
-            if (!listener.wait_for_device()) {
-                log.error("Connection timeout or failed");
-                return;
-            }
-            
-            log.info("Connected successfully");
-            
-            if (command == "shell") {
-                run_shell(device, cmd_args, log);
-            } else if (command == "push") {
-                run_push(device, cmd_args, log);
-            } else if (command == "pull") {
-                run_pull(device, cmd_args, log);
-            } else if (command == "install") {
-                run_install(device, cmd_args, log);
-            } else if (command == "uninstall") {
-                run_uninstall(device, cmd_args, log);
-            } else {
-                log.error("Unknown command: ", command);
-            }
-            
+
+    if (max_threads > 0 && max_threads < devices.size()) {
+        std::cout << "Processing " << devices.size() << " device(s), max " << max_threads
+                  << " at a time\n";
+    }
+
+    // Подключение к устройству происходит внутри задачи, поэтому к следующим
+    // устройствам из файла подключаемся только после освобождения воркера.
+    manager.runOnDevices(devices, [&](const std::string& addr) {
+        Logger log(addr);
+        log.info("Connecting...");
+
+        DeviceListener listener(log);
+        auto device = manager.connectDevice(addr, &listener);
+        if (!device) {
+            log.error("Failed to initiate connection");
+            return;
+        }
+
+        if (!listener.wait_for_device()) {
+            log.error("Connection timeout or failed");
             manager.disconnectDevice(addr);
-            log.info("Disconnected");
-        });
-    }
-    
-    for (auto& t : threads) {
-        t.join();
-    }
-    
+            return;
+        }
+
+        log.info("Connected successfully");
+
+        if (command == "shell") {
+            run_shell(device, cmd_args, log);
+        } else if (command == "push") {
+            run_push(device, cmd_args, log);
+        } else if (command == "pull") {
+            run_pull(device, cmd_args, log);
+        } else if (command == "install") {
+            run_install(device, cmd_args, log);
+        } else if (command == "uninstall") {
+            run_uninstall(device, cmd_args, log);
+        } else {
+            log.error("Unknown command: ", command);
+        }
+
+        // Освобождаем транспорт до того, как воркер возьмёт следующее устройство,
+        // иначе ограничение --max-threads не имело бы смысла.
+        device.reset();
+        manager.disconnectDevice(addr);
+        log.info("Disconnected");
+    });
+
     manager.stop();
     return 0;
 }
+

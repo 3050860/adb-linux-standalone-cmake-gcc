@@ -40,7 +40,58 @@ void AdbManager::stop() {
     }
 }
 
+void AdbManager::setMaxThreads(size_t max_threads) {
+    max_threads_.store(max_threads);
+}
+
+size_t AdbManager::maxThreads() const {
+    return max_threads_.load();
+}
+
+void AdbManager::runOnDevices(const std::vector<std::string>& addresses,
+                              const std::function<void(const std::string&)>& task) {
+    if (addresses.empty() || !task) return;
+
+    size_t workers_count = max_threads_.load();
+    if (workers_count == 0 || workers_count > addresses.size()) {
+        workers_count = addresses.size();
+    }
+
+    LOG(INFO) << "AdbManager: processing " << addresses.size() << " device(s) using "
+              << workers_count << " worker thread(s)";
+
+    // Общий индекс очереди: воркер берёт следующий адрес только когда освободился,
+    // т.е. одновременно обрабатывается не более workers_count устройств.
+    std::atomic<size_t> next_index{0};
+
+    std::vector<std::thread> workers;
+    workers.reserve(workers_count);
+    for (size_t i = 0; i < workers_count; ++i) {
+        workers.emplace_back([&addresses, &task, &next_index]() {
+            for (;;) {
+                const size_t index = next_index.fetch_add(1);
+                if (index >= addresses.size()) return;
+
+                const std::string& address = addresses[index];
+                try {
+                    task(address);
+                } catch (const std::exception& e) {
+                    // Один упавший девайс не должен утаскивать за собой воркер.
+                    LOG(ERROR) << "AdbManager: task for " << address << " threw: " << e.what();
+                } catch (...) {
+                    LOG(ERROR) << "AdbManager: task for " << address << " threw unknown exception";
+                }
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+}
+
 void AdbManager::eventLoopThread() {
+
     LOG(INFO) << "AdbManager: fdevent_loop started";
     fdevent_loop(); // Блокирующий вызов, работает пока не вызван fdevent_terminate_loop
     LOG(INFO) << "AdbManager: fdevent_loop stopped";
