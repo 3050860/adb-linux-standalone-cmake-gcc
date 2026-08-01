@@ -269,7 +269,18 @@ struct Options {
     // Ограничение параллелизма для групповых операций Client::for_each и *_all.
     // 0 — без ограничения (поток на устройство).
     size_t max_parallel = 0;
+
+    // Глобальный на процесс лимит одновременных подключений (§7). Общий для
+    // батч-режима и ручных connect(): библиотека никогда не держит открытыми
+    // больше max_connections устройств. 0 — без ограничения.
+    size_t max_connections = 0;
+
+    // Сколько connect() ждёт освобождения слота, если лимит исчерпан:
+    // 0 — не ждать вовсе (сразу Status::SlotBusy),
+    // ms::max() — ждать бесконечно, иначе — Status::SlotTimeout по истечении.
+    ms slot_acquire{30000};
 };
+
 
 // ---------------------------------------------------------------------------
 // Устройство
@@ -376,8 +387,18 @@ class LIBADB_API Client {
                                                 const std::string& package,
                                                 const UninstallOptions& options = {});
 
+    // Лимит одновременных подключений в рантайме. Уменьшение не рвёт уже
+    // открытые подключения: просто новые слоты не выдаются, пока число
+    // занятых не опустится ниже лимита. 0 — снять ограничение.
+    void set_max_connections(size_t limit);
+    size_t max_connections() const;
+
+    // Сколько слотов занято прямо сейчас (открытые подключения).
+    size_t active_connections() const;
+
     // Логирование: то же, что свободные функции, но через клиент.
     void set_log_options(const LogOptions& options);
+
     void set_log_level(LogLevel level);
     void set_log_sink(LogSink sink);
 

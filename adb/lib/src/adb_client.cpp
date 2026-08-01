@@ -446,12 +446,19 @@ std::string format_host_command(const char* command) {
 // }
 
 const std::optional<FeatureSet>& adb_get_feature_set(std::string* error) {
-    // ПЕРЕХВАТ: Если установлен наш девайс, возвращаем его фичи
+    // ПЕРЕХВАТ: если для текущего потока задано устройство, отдаём его фичи.
+    // Хранилище обязано быть thread_local: с обычным static потоки, работающие
+    // с разными устройствами, писали и читали бы один объект без синхронизации,
+    // и набор фич одного устройства «протекал» бы на другое (§14 п.2).
+    // Значение обновляем на каждом вызове: устройство в потоке может смениться,
+    // а кешировать по указателю нельзя — адрес освобождённого AdbDevice может
+    // быть переиспользован другим устройством.
     if (g_current_adb_device) {
-        static std::optional<FeatureSet> cached_features;
+        thread_local std::optional<FeatureSet> cached_features;
         cached_features = g_current_adb_device->getFeatures();
         return cached_features;
     }
+
 
     // ОРИГИНАЛЬНЫЙ КОД (оставляем без изменений для совместимости)
     static std::mutex feature_mutex [[clang::no_destroy]];

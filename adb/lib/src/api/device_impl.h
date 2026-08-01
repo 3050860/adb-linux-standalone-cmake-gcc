@@ -7,9 +7,11 @@
 #pragma once
 
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+
 
 #include "AdbDevice.h"
 #include "AdbManager.h"
@@ -84,10 +86,15 @@ struct Device::Impl {
     ms connect_timeout{15000};
     bool closed = false;
 
+    // Возврат слота подключения в пул клиента (§7). Задаётся в Client::connect
+    // сразу после захвата слота; вызывается ровно один раз при закрытии.
+    std::function<void()> release_slot;
+
     ~Impl();
 
     // Закрывает подключение и отпускает транспорт (idempotent).
     void close();
+
 };
 
 namespace internal {

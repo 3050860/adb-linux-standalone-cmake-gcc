@@ -221,18 +221,29 @@ DevicePtr DeviceFactory::create(std::unique_ptr<Device::Impl> impl) {
 // ---------------------------------------------------------------------------
 
 void Device::Impl::close() {
-    if (closed) return;
-    closed = true;
+    if (!closed) {
+        closed = true;
 
-    // Порядок важен: сначала отпускаем свой shared_ptr на AdbDevice, потом
-    // просим менеджер убрать транспорт — иначе устройство осталось бы живым
-    // и следующий connect получил бы старое соединение.
-    device.reset();
-    if (!serial.empty()) {
-        AdbManager::instance().disconnectDevice(serial);
+        // Порядок важен: сначала отпускаем свой shared_ptr на AdbDevice, потом
+        // просим менеджер убрать транспорт — иначе устройство осталось бы живым
+        // и следующий connect получил бы старое соединение.
+        device.reset();
+        if (!serial.empty()) {
+            AdbManager::instance().disconnectDevice(serial);
+        }
+        internal::emit_log(LogLevel::Debug, serial, "disconnected");
     }
-    internal::emit_log(LogLevel::Debug, serial, "disconnected");
+
+    // Слот отдаём последним и вне проверки closed: при неудачном подключении
+    // флаг выставляют вручную, а слот к тому моменту уже занят — иначе он
+    // остался бы занятым навсегда. Перемещаем, чтобы вызвать ровно один раз.
+    if (release_slot) {
+        auto release = std::move(release_slot);
+        release_slot = nullptr;
+        release();
+    }
 }
+
 
 Device::Impl::~Impl() {
     close();

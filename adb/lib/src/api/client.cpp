@@ -1,8 +1,11 @@
 // libadb: реализация Client — инициализация, подключение, групповые операции.
+#include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
 #include <vector>
+
 
 #include "AdbManager.h"
 #include "api/device_impl.h"
@@ -26,6 +29,69 @@ Result make_error_result(Status status, const std::string& message) {
     return result;
 }
 
+// Пул слотов подключения (§7). Один на процесс, общий для connect() и батча:
+// сколько бы потоков ни работало, открытых подключений не больше limit.
+class SlotPool {
+  public:
+    void set_limit(size_t limit) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            limit_ = limit;
+        }
+        // Лимит могли увеличить (или снять) — будим всех ожидающих.
+        cv_.notify_all();
+    }
+
+    size_t limit() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return limit_;
+    }
+
+    size_t active() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_;
+    }
+
+    // Занимает слот. timeout: 0 — не ждать, ms::max() — ждать бесконечно.
+    Status acquire(ms timeout, const std::string& serial) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto has_room = [this] { return limit_ == 0 || active_ < limit_; };
+
+        if (!has_room()) {
+            if (timeout <= ms::zero()) return Status::SlotBusy;
+
+            internal::emit_log(LogLevel::Debug, serial, "waiting for a connection slot");
+            bool acquired;
+            if (timeout == ms::max()) {
+                // wait_for(ms::max()) переполняет внутренние вычисления времени,
+                // поэтому «ждать бесконечно» обслуживаем отдельной веткой.
+                cv_.wait(lock, has_room);
+                acquired = true;
+            } else {
+                acquired = cv_.wait_for(lock, timeout, has_room);
+            }
+            if (!acquired) return Status::SlotTimeout;
+        }
+
+        ++active_;
+        return Status::Ok;
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (active_ > 0) --active_;
+        }
+        cv_.notify_one();
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    size_t limit_ = 0;
+    size_t active_ = 0;
+};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -33,9 +99,15 @@ Result make_error_result(Status status, const std::string& message) {
 // ---------------------------------------------------------------------------
 
 struct Client::Impl {
+
     mutable std::shared_mutex mutex;
     Options options;
     bool initialized = false;
+
+    // Слоты подключений: живут вне options, чтобы счётчик занятых не сбрасывался
+    // повторным initialize().
+    SlotPool slots;
+
 
     // Живые подключения, выданные connect(): нужны для close_all().
     // weak_ptr — владельцем остаётся вызывающий; мы не продлеваем жизнь Device.
@@ -98,6 +170,8 @@ Status Client::initialize(const Options& options) {
 
     auto& manager = AdbManager::instance();
     manager.setMaxThreads(options.max_parallel);
+    impl_->slots.set_limit(options.max_connections);
+
 
     bool need_start = false;
     {
@@ -148,11 +222,25 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
         return nullptr;
     }
 
+    // Слот занимаем до создания транспорта: лимит должен считать реально
+    // открытые соединения, а не успешные подключения.
+    const Status slot_status = impl_->slots.acquire(options.slot_acquire, serial);
+    if (slot_status != Status::Ok) {
+        set_status(slot_status);
+        internal::emit_log(LogLevel::Warn, serial,
+                           std::string("no connection slot: ") + to_string(slot_status));
+        return nullptr;
+    }
+
     auto impl = std::make_unique<Device::Impl>();
     impl->address = address;
     impl->serial = serial;
     impl->connect_timeout = options.connect_timeout;
     impl->listener = std::make_unique<internal::FacadeListener>(serial);
+    // Дальше любой выход из функции проходит через Impl::close() — прямо или
+    // через деструктор Impl, — поэтому слот вернётся в пул при любом исходе.
+    impl->release_slot = [pool = &impl_->slots] { pool->release(); };
+
 
     internal::emit_log(LogLevel::Debug, serial, "connecting");
     impl->device = AdbManager::instance().connectDevice(serial, impl->listener.get());
@@ -192,9 +280,22 @@ void Client::for_each(const std::vector<std::string>& addresses,
     }
     if (!task) return;
 
-    // Ограничение параллелизма живёт в AdbManager: подключение к очередному
-    // устройству происходит внутри задачи, т.е. только когда освободился воркер.
+    // Число воркеров не должно превышать лимит подключений: иначе лишние потоки
+    // просто висели бы в ожидании слота и упирались в slot_acquire. Само
+    // ограничение всё равно обеспечивает пул слотов — это лишь чтобы не плодить
+    // заведомо бесполезные потоки.
+    const Options options = impl_->snapshot();
+    size_t workers = options.max_parallel;
+    if (options.max_connections > 0 &&
+        (workers == 0 || workers > options.max_connections)) {
+        workers = options.max_connections;
+    }
+    AdbManager::instance().setMaxThreads(workers);
+
+    // Подключение к очередному устройству происходит внутри задачи, то есть
+    // только когда освободился и воркер, и слот.
     AdbManager::instance().runOnDevices(addresses, [&](const std::string& address) {
+
         Status status = Status::Ok;
         DevicePtr device = connect(address, &status);
         task(device, address, status);
@@ -273,7 +374,26 @@ std::map<std::string, Result> Client::uninstall_all(const std::vector<std::strin
                    [&](Device& device) { return device.uninstall(package, options); });
 }
 
+void Client::set_max_connections(size_t limit) {
+    {
+        std::unique_lock<std::shared_mutex> lock(impl_->mutex);
+        impl_->options.max_connections = limit;
+    }
+    // Уже открытые подключения не трогаем: пул просто не выдаст новые слоты,
+    // пока число занятых не опустится ниже лимита.
+    impl_->slots.set_limit(limit);
+}
+
+size_t Client::max_connections() const {
+    return impl_->slots.limit();
+}
+
+size_t Client::active_connections() const {
+    return impl_->slots.active();
+}
+
 void Client::set_log_options(const LogOptions& options) {
+
     {
         std::unique_lock<std::shared_mutex> lock(impl_->mutex);
         impl_->options.log = options;
