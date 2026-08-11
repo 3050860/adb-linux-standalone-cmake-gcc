@@ -35,6 +35,7 @@
 
 // #include "client/commandline.h"
 #include "helpers.h"
+#include "sync_progress.h"
 
 #include <android-base/file.h>
 #include <android-base/strings.h>
@@ -43,6 +44,29 @@
 using namespace std::literals;
 
 typedef void(sync_ls_cb)(unsigned mode, uint64_t size, uint64_t time, const char* name);
+
+// --- Наблюдатель за передачей (см. sync_progress.h) -------------------------
+//
+// thread_local: sync целиком выполняется в потоке, который позвал
+// do_sync_push_fd()/do_sync_pull_fd(), а таких потоков в библиотеке много.
+namespace {
+thread_local const SyncProgressObserver* g_sync_observer = nullptr;
+}  // namespace
+
+const SyncProgressObserver* adb_sync_set_observer(const SyncProgressObserver* observer) {
+    const SyncProgressObserver* previous = g_sync_observer;
+    g_sync_observer = observer;
+    return previous;
+}
+
+const SyncProgressObserver* adb_sync_observer() {
+    return g_sync_observer;
+}
+
+// Прервать передачу? Проверка дешёвая: обычно наблюдателя нет вовсе.
+static bool sync_should_abort() {
+    return g_sync_observer && g_sync_observer->should_abort && g_sync_observer->should_abort();
+}
 
 struct syncsendbuf {
     unsigned id;
@@ -320,8 +344,18 @@ class SyncConnection {
 
     void ReportProgress(const std::string& file, uint64_t file_copied_bytes,
                         uint64_t file_total_bytes) {
+        // Наблюдателю отдаём без троттлинга: он сам решает, что делать с
+        // частотой (в libadb это Options::progress_interval).
+        if (g_sync_observer && g_sync_observer->on_progress) {
+            g_sync_observer->on_progress(file, file_copied_bytes, file_total_bytes);
+        }
         current_ledger_.ReportProgress(line_printer_, file, file_copied_bytes, file_total_bytes);
     }
+
+    // Полезные байты за всё соединение (без сжатия). Именно global_ledger_:
+    // current_ledger_ обнуляется NewTransfer() на каждом файле, поэтому по нему
+    // в многофайловой передаче виден только последний файл.
+    uint64_t BytesTransferred() const { return global_ledger_.bytes_transferred; }
 
     void ReportTransferRate(const std::string& file, TransferDirection direction) {
         current_ledger_.ReportTransferRate(line_printer_, file, direction);
@@ -678,6 +712,13 @@ class SyncConnection {
 
         bool sending = true;
         while (sending) {
+            // Отмена/таймаут проверяются между блоками: гранулярность —
+            // один блок SYNC_DATA_MAX (64 КиБ).
+            if (sync_should_abort()) {
+                Error("transfer of '%s' aborted", lpath.c_str());
+                return false;
+            }
+
             Block input(SYNC_DATA_MAX);
             int r = adb_read(lfd.get(), input.data(), input.size());
             if (r < 0) {
@@ -755,6 +796,11 @@ class SyncConnection {
         sbuf.id = ID_DATA;
 
         while (true) {
+            if (sync_should_abort()) {
+                Error("transfer of '%s' aborted", lpath.c_str());
+                return false;
+            }
+
             int bytes_read = adb_read(lfd, sbuf.data, max);
             if (bytes_read == -1) {
                 Error("reading '%s' locally failed: %s", lpath.c_str(), strerror(errno));
@@ -991,6 +1037,11 @@ class SyncConnection {
             }
             _exit(1);
         }
+        // Единственная точка записи в сокет при push — здесь и считаем, сколько
+        // реально ушло в сеть (после сжатия).
+        if (g_sync_observer && g_sync_observer->on_wire_bytes) {
+            g_sync_observer->on_wire_bytes(data_length);
+        }
         return true;
     }
 };
@@ -1107,6 +1158,12 @@ static bool sync_recv_v1(SyncConnection& sc, const char* rpath, const char* lpat
 
     uint64_t bytes_copied = 0;
     while (true) {
+        if (sync_should_abort()) {
+            sc.Error("transfer of '%s' aborted", rpath);
+            adb_unlink(lpath);
+            return false;
+        }
+
         syncmsg msg;
         if (!ReadFdExactly(sc.fd, &msg.data, sizeof(msg.data))) {
             adb_unlink(lpath);
@@ -1131,6 +1188,11 @@ static bool sync_recv_v1(SyncConnection& sc, const char* rpath, const char* lpat
         if (!ReadFdExactly(sc.fd, buffer, msg.data.size)) {
             adb_unlink(lpath);
             return false;
+        }
+
+        // Легаси-путь идёт без сжатия, поэтому «по проводу» == размер блока.
+        if (auto* observer = adb_sync_observer(); observer && observer->on_wire_bytes) {
+            observer->on_wire_bytes(msg.data.size + sizeof(msg.data));
         }
 
         if (!WriteFdExactly(lfd, buffer, msg.data.size)) {
@@ -1192,6 +1254,12 @@ static bool sync_recv_v2(SyncConnection& sc, const char* rpath, const char* lpat
     }
 
     while (true) {
+        if (sync_should_abort()) {
+            sc.Error("transfer of '%s' aborted", rpath);
+            adb_unlink(lpath);
+            return false;
+        }
+
         syncmsg msg;
         if (!ReadFdExactly(sc.fd, &msg.data, sizeof(msg.data))) {
             adb_unlink(lpath);
@@ -1218,6 +1286,10 @@ static bool sync_recv_v2(SyncConnection& sc, const char* rpath, const char* lpat
             if (!ReadFdExactly(sc.fd, block.data(), msg.data.size)) {
                 adb_unlink(lpath);
                 return false;
+            }
+            // Сжатые байты, реально пришедшие из сокета.
+            if (auto* observer = adb_sync_observer(); observer && observer->on_wire_bytes) {
+                observer->on_wire_bytes(msg.data.size + sizeof(msg.data));
             }
             decoder->Append(std::move(block));
         }
@@ -1685,7 +1757,9 @@ bool do_sync_sync(const std::string& lpath, const std::string& rpath, bool list_
 /* =========================================================================================================================== */
 // Новые функции, которые принимают готовый FD и FeatureSet
 bool do_sync_push_fd(unique_fd fd, const FeatureSet& features, const std::vector<const char*>& srcs, const char* dst, bool sync,
-                     CompressionType compression, bool dry_run, bool quiet) {
+                     CompressionType compression, bool dry_run, bool quiet,
+                     uint64_t* bytes_transferred) {
+    if (bytes_transferred) *bytes_transferred = 0;
     SyncConnection sc(std::move(fd), features);
     if (!sc.IsValid()) return false;
     sc.SetQuiet(quiet);
@@ -1780,11 +1854,14 @@ bool do_sync_push_fd(unique_fd fd, const FeatureSet& features, const std::vector
 
     success &= sc.ReadAcknowledgements(true);
     sc.ReportOverallTransferRate(TransferDirection::push);
+    if (bytes_transferred) *bytes_transferred = sc.BytesTransferred();
     return success;
 }
 
 bool do_sync_pull_fd(unique_fd fd, const FeatureSet& features, const std::vector<const char*>& srcs, const char* dst, bool copy_attrs,
-                     CompressionType compression, const char* name, bool quiet) {
+                     CompressionType compression, const char* name, bool quiet,
+                     uint64_t* bytes_transferred) {
+    if (bytes_transferred) *bytes_transferred = 0;
     SyncConnection sc(std::move(fd), features);
     if (!sc.IsValid()) return false;
     sc.SetQuiet(quiet);
@@ -1891,5 +1968,6 @@ bool do_sync_pull_fd(unique_fd fd, const FeatureSet& features, const std::vector
     }
 
     sc.ReportOverallTransferRate(TransferDirection::pull);
+    if (bytes_transferred) *bytes_transferred = sc.BytesTransferred();
     return success;
 }

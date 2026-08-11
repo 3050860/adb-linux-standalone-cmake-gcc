@@ -12,6 +12,7 @@
 #include "AdbSession.h"
 #include "adb_install_lib.h"
 #include "adb_utils.h"
+#include "sync_progress.h"
 
 #include "api/device_impl.h"
 #include "api/events.h"
@@ -32,15 +33,40 @@ uint64_t file_size(const std::string& path) {
     return static_cast<uint64_t>(st.st_size);
 }
 
-void fill_transfer_stats(Result& result, uint64_t bytes, ms duration) {
+void fill_transfer_stats(Result& result, uint64_t bytes, uint64_t bytes_on_wire, ms duration) {
     result.transfer.bytes = bytes;
-    // Внутренний SyncConnection пока не сообщает, сколько ушло в сеть после
-    // сжатия, поэтому bytes_on_wire остаётся нулём (см. журнал, этап 3).
+    result.transfer.bytes_on_wire = bytes_on_wire;
     result.transfer.duration = duration;
     if (bytes > 0 && duration.count() > 0) {
         result.transfer.mib_per_sec =
             (static_cast<double>(bytes) / (1024.0 * 1024.0)) / (duration.count() / 1000.0);
     }
+}
+
+// Счётчики одной передачи: заполняются из наблюдателя sync (§14 п.5).
+// Живут в стеке операции, наблюдатель ссылается на них.
+struct TransferCounters {
+    uint64_t payload = 0;   // полезные байты (последнее значение прогресса по файлу)
+    uint64_t on_wire = 0;   // байты, реально прошедшие через сокет
+    uint64_t expected = 0;  // ожидаемый размер, если известен
+};
+
+// Собирает наблюдателя, который кормит события операции и колбэк вызывающего.
+// serial и progress живут не меньше самого наблюдателя (стек операции).
+SyncProgressObserver make_observer(internal::OperationContext& op, const std::string& serial,
+                                  const ProgressFn& progress, TransferCounters& counters) {
+    SyncProgressObserver observer;
+    observer.on_progress = [&op, &serial, &progress, &counters](const std::string& /*path*/,
+                                                               uint64_t done, uint64_t total) {
+        // done приходит от sync накопительно по текущему файлу; total может быть
+        // нулём (размер неизвестен) — тогда подставляем то, что знаем сами.
+        counters.payload = done;
+        const uint64_t reported_total = total != 0 ? total : counters.expected;
+        op.progress(done, reported_total);
+        if (progress) progress(serial, done, reported_total);
+    };
+    observer.on_wire_bytes = [&counters](uint64_t bytes) { counters.on_wire += bytes; };
+    return observer;
 }
 
 // Оборачивает аргумент в одинарные кавычки для shell на устройстве.
@@ -333,22 +359,34 @@ Result Device::push(const std::string& local, const std::string& remote,
 
     AdbFileSync sync(impl_->device);
     op.set_phase(Phase::Transfer);
+
+    TransferCounters counters;
+    counters.expected = size;
+    const SyncProgressObserver observer =
+        make_observer(op, impl_->serial, options.on_progress, counters);
+
     const auto transfer_started = clock_type::now();
     // quiet = true: прогресс-бар SyncConnection пишет в stdout и ломал бы вывод
-    // приложения, у которого много устройств одновременно.
+    // приложения, у которого много устройств одновременно. Прогресс идёт
+    // наблюдателем — в события и в options.on_progress.
+    uint64_t transferred = 0;
     const bool ok = sync.push({local}, remote, options.sync_only_newer,
-                              internal::to_compression_type(options.compression), true);
+                              internal::to_compression_type(options.compression), true, &observer,
+                              &transferred);
     const ms transfer_duration = elapsed_since(transfer_started);
 
     Result result;
     result.phase = Phase::Transfer;
     result.duration = elapsed_since(started);
     if (ok) {
-        fill_transfer_stats(result, size, transfer_duration);
-        // Промежуточного прогресса от SyncConnection пока нет (этап 6), поэтому
-        // отдаём хотя бы завершающее событие «передано столько-то».
-        op.progress(size, size, true);
-        if (options.on_progress) options.on_progress(impl_->serial, size, size);
+        // transferred от SyncConnection точнее размера файла: при sync=true часть
+        // файлов пропускается, а у каталогов размер вообще не при чём.
+        const uint64_t bytes = transferred > 0 ? transferred : size;
+        fill_transfer_stats(result, bytes, counters.on_wire, transfer_duration);
+        // Завершающее событие прогресса (force): при быстрой передаче троттлинг
+        // мог съесть последнее «100 %».
+        op.progress(bytes, bytes, true);
+        if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
     } else {
         result.status = Status::IoError;
         result.error = impl_->listener->take_error();
@@ -374,20 +412,30 @@ Result Device::pull(const std::string& remote, const std::string& local,
 
     AdbFileSync sync(impl_->device);
     op.set_phase(Phase::Transfer);
+
+    // Размер файла на устройстве заранее не известен: sync сообщит его сам в
+    // первом же событии прогресса (total).
+    TransferCounters counters;
+    const SyncProgressObserver observer =
+        make_observer(op, impl_->serial, options.on_progress, counters);
+
     const auto transfer_started = clock_type::now();
+    uint64_t transferred = 0;
     const bool ok = sync.pull({remote}, local, false,
-                              internal::to_compression_type(options.compression), true);
+                              internal::to_compression_type(options.compression), true, &observer,
+                              &transferred);
     const ms transfer_duration = elapsed_since(transfer_started);
 
     Result result;
     result.phase = Phase::Transfer;
     result.duration = elapsed_since(started);
     if (ok) {
-        // Размер известен только после скачивания — берём с локальной копии.
-        const uint64_t size = file_size(local);
-        fill_transfer_stats(result, size, transfer_duration);
-        op.progress(size, size, true);
-        if (options.on_progress) options.on_progress(impl_->serial, size, size);
+        // Если sync ничего не сообщил (например, скачали каталог), падаем на
+        // размер локальной копии.
+        const uint64_t bytes = transferred > 0 ? transferred : file_size(local);
+        fill_transfer_stats(result, bytes, counters.on_wire, transfer_duration);
+        op.progress(bytes, bytes, true);
+        if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
     } else {
         result.status = Status::IoError;
         result.error = impl_->listener->take_error();
@@ -489,21 +537,37 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     // а из кода установки, который печатал их в stdout процесса. Перенаправляем их
     // в result.output: библиотека не должна писать в консоль приложения.
     adb_install_set_status_sink(&result.output);
+
+    // Прогресс заливки apk: install льёт файл через copy_to_file(), там стоит
+    // тот же хук наблюдателя, что и в sync.
+    const uint64_t apk_size = file_size(apk_path);
+    TransferCounters counters;
+    counters.expected = apk_size;
+    const SyncProgressObserver observer =
+        make_observer(op, impl_->serial, options.on_progress, counters);
+    const SyncProgressObserver* previous_observer = adb_sync_set_observer(&observer);
+
+    const auto transfer_started = clock_type::now();
     AdbInstaller installer(impl_->device);
     const bool ok = installer.install({apk_path}, flags);
+    const ms transfer_duration = elapsed_since(transfer_started);
+
+    adb_sync_set_observer(previous_observer);
     adb_install_set_status_sink(nullptr);
     impl_->listener->clear_output_target();
 
     impl_->device->clearActiveSessions();
 
     result.duration = elapsed_since(started);
-    const uint64_t apk_size = file_size(apk_path);
-    fill_transfer_stats(result, apk_size, result.duration);
+    // Байты берём от наблюдателя: install-write мог залить не весь файл (ошибка),
+    // а на legacy-пути apk уходит push'ем — счётчик всё равно один.
+    const uint64_t bytes = counters.payload > 0 ? counters.payload : apk_size;
+    fill_transfer_stats(result, bytes, counters.on_wire, transfer_duration);
     if (ok) {
         result.phase = Phase::Finalize;
         op.set_phase(Phase::Finalize);
-        op.progress(apk_size, apk_size, true);
-        if (options.on_progress) options.on_progress(impl_->serial, apk_size, apk_size);
+        op.progress(bytes, bytes, true);
+        if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
         op.finish(result);
         return result;
     }

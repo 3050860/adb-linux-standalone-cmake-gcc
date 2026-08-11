@@ -419,3 +419,103 @@ namespace `libadb` (`_ZN6libadb*`, `_ZNK6libadb*`, `_ZTIN/_ZTSN/_ZTVN6libadb*`),
   ещё никем не публикуются: heartbeat нужен health-check'у коммита (этап 7),
   retry — `ConflictPolicy` (этап 9).
 
+## Этап 6 — статистика передачи (§14 п.5)
+
+**Что сделано**
+
+Закрыт пункт 5 §14 («`SyncConnection` работает в режиме `quiet` — нужен колбэк
+прогресса и возможность прерывания»).
+
+Новый внутренний интерфейс `adb/lib/include/sync_progress.h`:
+
+```cpp
+struct SyncProgressObserver {
+    std::function<void(const std::string& path, uint64_t done, uint64_t total)> on_progress;
+    std::function<void(uint64_t bytes)> on_wire_bytes;
+    std::function<bool()> should_abort;
+};
+const SyncProgressObserver* adb_sync_set_observer(const SyncProgressObserver*);
+const SyncProgressObserver* adb_sync_observer();
+```
+
+Наблюдатель ставится **на текущий поток** (`thread_local`) — так же, как уже
+сделаны `adb_set_current_device()` и `adb_install_set_status_sink()`: sync
+целиком выполняется в потоке, который позвал `do_sync_push_fd()`/
+`do_sync_pull_fd()`, а таких потоков в библиотеке много.
+
+Точки перехвата:
+
+- `SyncConnection::ReportProgress()` — единственное место, куда стягивается
+  прогресс всех четырёх путей передачи (`SendSmallFile`, `SendLargeFile`,
+  `SendLargeFileLegacy`, `sync_recv`, `sync_recv_v2`).
+- `SyncConnection::WriteOrDie()` — единственная запись в сокет при push,
+  отсюда `bytes_on_wire` (после сжатия).
+- Чтения `ReadFdExactly(sc.fd, …)` в `sync_recv`/`sync_recv_v2` — `bytes_on_wire`
+  для pull.
+- `copy_to_file()` в `helpers.cpp` — тот же наблюдатель: `install` льёт apk
+  через `pm install-write` именно этим циклом, и без хука фаза `Transfer`
+  установки была бы полностью «слепой».
+- Проверки `should_abort()` вставлены в циклы push (обе версии) и pull (обе
+  версии). Гранулярность — один блок `SYNC_DATA_MAX` (64 КиБ); используется
+  этапом 7 (stall-таймаут) и этапом 8 (отмена).
+
+`do_sync_push_fd()`/`do_sync_pull_fd()` получили необязательный выходной
+параметр `uint64_t* bytes_transferred`, `AdbFileSync::push/pull` — наблюдателя
+и тот же выходной параметр (оба со значениями по умолчанию, поэтому `adirect`
+не изменился ни на строку).
+
+`Device::push/pull/install`: `TransferCounters` + `make_observer()` в
+`device.cpp`. `Result::transfer` теперь заполняется целиком — `bytes`,
+`bytes_on_wire`, `duration`, `mib_per_sec`; тот же поток идёт в
+`OperationProgress` и в `*Options::on_progress`.
+
+**Принятые решения и грабли**
+
+1. **`bytes` берём у `SyncConnection`, а не из `stat()` локального файла.**
+   При `sync_only_newer` часть файлов пропускается, у каталогов размер вообще
+   не при чём, а на pull размер на устройстве заранее неизвестен. `stat()`
+   остаётся запасным вариантом, если sync ничего не сообщил.
+2. **`BytesTransferred()` читает `global_ledger_`, а не `current_ledger_`.**
+   `NewTransfer()` обнуляет `current_ledger_` на каждом файле, поэтому по нему
+   в многофайловой передаче был бы виден только последний файл.
+3. **`bytes_on_wire` при pull считается вместе с заголовком блока**
+   (`msg.data.size + sizeof(msg.data)`): это и есть то, что реально прочитано
+   из сокета. Поэтому без сжатия `bytes_on_wire` немного больше `bytes` —
+   так и должно быть (проверяется тестом).
+4. **`total` в прогрессе может прийти нулём** (sync не всегда знает размер) —
+   тогда подставляется `TransferCounters::expected`, то есть то, что знаем сами.
+5. **Наблюдатель снимается через RAII** (`ScopedSyncObserver` в
+   `AdbFileSync.cpp`) и сохраняет предыдущего: наблюдатели вкладываются
+   (install → внутренний push на legacy-пути), а `thread_local`, оставленный
+   висеть после выхода, указывал бы на мёртвый стек.
+6. **`copy_to_file()` не знает пути файла** — отдаёт пустую строку и
+   `total = 0`; для install это нормально, ожидаемый размер подставляет
+   `Device::install()`.
+
+**Что проверено (`test/auto/test_014_transfer_stats.cpp`, 30 проверок, ALL
+PASSED на 192.168.177.249)**
+
+- push 4 МиБ **без** сжатия: `bytes == 4194304`, `bytes_on_wire == 4194824`
+  (полезные + заголовки блоков), `duration = 379 ms`, `mib_per_sec = 10.55`;
+- `on_progress` вызван 65 раз, значения не идут назад, последнее — 100 %;
+  `OperationProgress` — те же 65 событий;
+- push того же объёма **со** сжатием (`Compression::Any`, файл из одинаковых
+  байт): `bytes` не изменился, `bytes_on_wire == 1361` — то есть хук считает
+  именно то, что уходит в сокет, а не полезную нагрузку;
+- pull: `bytes == 4194304`, `bytes_on_wire == 4194824`, `mib_per_sec = 10.99`,
+  67 событий прогресса;
+- `progress_interval = 100 s` → ровно 2 события прогресса (первое и
+  завершающее `force`), то есть троттлинг работает и «100 %» не теряется;
+- install `test/main.apk` (60 728 027 байт): `transfer.bytes` совпал с размером
+  файла до байта, `mib_per_sec = 4.16`, 928 вызовов `on_progress`.
+
+Регрессии: `test_011`, `test_012`, `test_013` — ALL PASSED;
+`adirect -f ... shell` на живом устройстве работает как прежде.
+
+**Что осталось**
+
+- `should_abort` пока никем не заполняется: таймауты (этап 7) и отмена
+  (этап 8).
+- `install` отдаёт прогресс одной сплошной фазой; разбивка по
+  `Prepare/CreateSession/Transfer/Commit` со своими таймаутами — этап 7.
+

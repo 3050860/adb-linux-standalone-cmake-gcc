@@ -34,6 +34,8 @@
 
 #include "helpers.h"
 
+#include "sync_progress.h"
+
 #include "adb.h"
 #include "adb_auth.h"
 #include "adb_client.h"
@@ -461,6 +463,19 @@ bool copy_to_file(int inFd, int outFd) {
             adb_write(outFd, buf.data(), len);
         }
         total += len;
+
+        // Тот же наблюдатель, что и у sync: install льёт apk через этот цикл
+        // (pm install-write), и без хука здесь фаза Transfer установки была бы
+        // полностью «слепой». Путь не знаем — отдаём пустую строку.
+        if (auto* observer = adb_sync_observer(); observer) {
+            if (observer->on_progress) observer->on_progress(std::string(), total, 0);
+            if (observer->on_wire_bytes) observer->on_wire_bytes(len);
+            if (observer->should_abort && observer->should_abort()) {
+                D("copy_to_file(): aborted by observer after %lu bytes", total);
+                result = false;
+                break;
+            }
+        }
     }
 
     stdinout_raw_epilogue(inFd, outFd, old_stdin_mode, old_stdout_mode);
