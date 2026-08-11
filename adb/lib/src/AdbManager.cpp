@@ -13,8 +13,15 @@ AdbManager& AdbManager::instance() {
 void AdbManager::start() {
     if (is_running_) return;
     
-    // Инициализируем аутентификацию (загружает ~/.android/adbkey)
-    adb_auth_init();
+    // Инициализируем аутентификацию (загружает ~/.android/adbkey).
+    // Если авторизацию уже настроили (libadb делает это в Client::initialize()
+    // через adb_auth_init_ex с настройками вызывающего) — второй раз не лезем:
+    // иначе стандартный набор подмешался бы к явно заданному (§5). Проверяем
+    // именно флаг «настроено», а не «ключей ноль»: пустой набор — законная
+    // конфигурация (use_default_key_store=false без своих ключей).
+    if (!adb_auth_is_configured()) {
+        adb_auth_init();
+    }
     
     is_running_ = true;
     event_thread_ = std::thread(&AdbManager::eventLoopThread, this);

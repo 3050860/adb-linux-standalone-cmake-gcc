@@ -8,6 +8,7 @@
 
 
 #include "AdbManager.h"
+#include "adb_auth.h"
 #include "api/device_impl.h"
 #include "api/events.h"
 #include "api/operation_impl.h"
@@ -170,6 +171,10 @@ Client& Client::instance() {
     return *instance;
 }
 
+std::vector<std::string> auth_key_fingerprints() {
+    return adb_auth_key_fingerprints();
+}
+
 Status Client::initialize(const Options& options) {
     internal::ensure_logging_initialized();
     internal::ensure_sigpipe_ignored();
@@ -191,6 +196,26 @@ Status Client::initialize(const Options& options) {
 
     // Пул асинхронных операций (§9): отдельный от батч-режима.
     internal::AsyncPool::instance().configure(options.async_worker_threads);
+
+    // Авторизация (§5) — строго до старта event loop: рукопожатие с устройством
+    // начинается сразу после connect(), и ключи к этому моменту должны быть на
+    // месте. Ошибку по конкретному ключу отдаём вызывающему как есть.
+    {
+        AdbAuthConfig auth;
+        auth.key_files = options.auth.key_files;
+        auth.private_keys_pem = options.auth.private_keys_pem;
+        auth.use_default_key_store = options.auth.use_default_key_store;
+        auth.generate_ephemeral_if_empty = options.auth.generate_ephemeral_if_empty;
+        auth.save_generated_key_to = options.auth.save_generated_key_to;
+
+        const std::string error = adb_auth_init_ex(auth);
+        if (!error.empty()) {
+            internal::emit_log(LogLevel::Error, "", "auth: " + error);
+            return Status::InvalidArgument;
+        }
+        internal::emit_log(LogLevel::Debug, "",
+                           "auth: " + std::to_string(adb_auth_key_count()) + " key(s) loaded");
+    }
 
     auto& manager = AdbManager::instance();
     manager.setMaxThreads(options.max_parallel);
