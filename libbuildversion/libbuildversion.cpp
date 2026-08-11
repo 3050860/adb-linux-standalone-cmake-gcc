@@ -23,7 +23,7 @@
 namespace android {
 namespace build {
 
-#define PLACEHOLDER "SOONG BUILD NUMBER PLACEHOLDER"
+#define PLACEHOLDER "netarium"
 
 extern "C" {
   char soong_build_number[128] = PLACEHOLDER;

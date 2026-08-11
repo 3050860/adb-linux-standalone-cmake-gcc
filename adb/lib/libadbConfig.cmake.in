@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+# Конфиг для find_package(libadb 1.0 REQUIRED).
+#
+# Потребителю нужен ровно один таргет — libadb::adb. Публичные заголовки не
+# включают ничего внутреннего (только STL), а все внутренние зависимости
+# слинкованы в .so и скрыты version script'ом, поэтому никаких
+# find_dependency() здесь нет и быть не должно.
+
+include("${CMAKE_CURRENT_LIST_DIR}/libadbTargets.cmake")
+
+check_required_components(libadb)

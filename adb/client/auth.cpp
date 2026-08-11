@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2012 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #define TRACE_TAG AUTH
 
 #include <dirent.h>
@@ -25,6 +9,7 @@
 #endif
 
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <string>
@@ -152,6 +137,50 @@ static bool load_key(const std::string& file) {
     LOG(INFO) << (already_loaded ? "ignored already-loaded" : "loaded new") << " key from '" << file
               << "' with fingerprint " << SHA256BitsToHexString(fingerprint);
     return true;
+}
+
+// Загружает приватный ключ из текста PEM (§5 libadb): ключи могут приходить не
+// из файлов, а из чужой БД или vault. label используется только в сообщениях.
+// Возвращает пустую строку при успехе, иначе описание ошибки.
+static std::string load_key_from_pem(const std::string& pem, const std::string& label) {
+    if (pem.empty()) return "empty PEM for " + label;
+
+    // BIO поверх готовой строки: файл на диск ради этого создавать не нужно.
+    bssl::UniquePtr<BIO> bio(BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())));
+    if (!bio) return "cannot allocate BIO for " + label;
+
+    std::shared_ptr<RSA> key;
+    // Сначала пробуем как RSA PEM ("BEGIN RSA PRIVATE KEY"), затем как PKCS#8
+    // ("BEGIN PRIVATE KEY") — вызывающий может дать любой из двух форматов.
+    if (RSA* rsa = PEM_read_bio_RSAPrivateKey(bio.get(), nullptr, nullptr, nullptr)) {
+        key = std::shared_ptr<RSA>(rsa, RSA_free);
+    } else {
+        ERR_clear_error();
+        if (BIO_reset(bio.get()) != 1) return "cannot rewind PEM for " + label;
+
+        bssl::UniquePtr<EVP_PKEY> pkey(
+                PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr));
+        if (!pkey) {
+            ERR_clear_error();
+            return "cannot parse PEM private key for " + label;
+        }
+        RSA* rsa_from_pkey = EVP_PKEY_get1_RSA(pkey.get());
+        if (!rsa_from_pkey) {
+            ERR_clear_error();
+            return "PEM key for " + label + " is not an RSA key";
+        }
+        key = std::shared_ptr<RSA>(rsa_from_pkey, RSA_free);
+    }
+
+    const std::string fingerprint = hash_key(key.get());
+    if (fingerprint.empty()) return "cannot hash public key for " + label;
+
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    const bool already_loaded = g_keys.find(fingerprint) != g_keys.end();
+    if (!already_loaded) g_keys[fingerprint] = std::move(key);
+    LOG(INFO) << (already_loaded ? "ignored already-loaded" : "loaded new") << " key from " << label
+              << " with fingerprint " << SHA256BitsToHexString(fingerprint);
+    return {};
 }
 
 static bool load_keys(const std::string& path, bool allow_dir = true) {
@@ -429,6 +458,116 @@ void adb_auth_init() {
     for (const std::string& path : key_paths) {
         load_keys(path);
     }
+}
+
+size_t adb_auth_key_count() {
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    return g_keys.size();
+}
+
+std::vector<std::string> adb_auth_key_fingerprints() {
+    std::vector<std::string> result;
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    result.reserve(g_keys.size());
+    for (const auto& it : g_keys) {
+        result.push_back(SHA256BitsToHexString(it.first));
+    }
+    return result;
+}
+
+// Была ли авторизация настроена явно через adb_auth_init_ex(). Нужен именно
+// флаг, а не «ключей ноль»: конфигурация «ключей нет и генерировать нельзя» —
+// законная, и подменять её стандартным набором нельзя.
+static std::atomic<bool> g_auth_configured{false};
+
+bool adb_auth_is_configured() {
+    return g_auth_configured.load(std::memory_order_acquire);
+}
+
+std::string adb_auth_init_ex(const AdbAuthConfig& config) {
+    LOG(INFO) << "adb_auth_init_ex...";
+    g_auth_configured.store(true, std::memory_order_release);
+
+    // Стандартный набор (~/.android/adbkey + $ADB_VENDOR_KEYS) — только если
+    // разрешён: сервису под своим пользователем он часто не нужен и не доступен.
+    if (config.use_default_key_store) {
+        if (!load_userkey()) {
+            LOG(ERROR) << "Failed to load (or generate) user key";
+        }
+
+        const auto& key_paths = get_vendor_keys();
+#if defined(__linux__)
+        // Слежение за каталогами ключей ставится РОВНО ОДИН РАЗ за процесс:
+        // Client::initialize() можно звать повторно (например, чтобы поменять
+        // таймауты), а fdevent_create() из чужого потока при уже работающем
+        // event loop приводит к аварийному завершению.
+        static std::once_flag inotify_once;
+        std::call_once(inotify_once, [&key_paths] { adb_auth_inotify_init(key_paths); });
+#endif
+        for (const std::string& path : key_paths) {
+            load_keys(path);
+        }
+    }
+
+    // Ошибку по конкретному ключу не глотаем: вызывающий должен узнать, какой
+    // именно ключ не разобрался (§5).
+    for (const std::string& file : config.key_files) {
+        if (!load_keys(file)) {
+            return "cannot load key file '" + file + "'";
+        }
+    }
+
+    for (size_t i = 0; i < config.private_keys_pem.size(); ++i) {
+        const std::string label = "private_keys_pem[" + std::to_string(i) + "]";
+        const std::string error = load_key_from_pem(config.private_keys_pem[i], label);
+        if (!error.empty()) return error;
+    }
+
+    if (adb_auth_key_count() == 0 && config.generate_ephemeral_if_empty) {
+        // Эфемерный ключ: устройство всё равно спросит подтверждение отпечатка,
+        // зато подключение возможно без файлов на диске вообще.
+        auto rsa_2048 = adb::crypto::CreateRSA2048Key();
+        if (!rsa_2048) return "failed to generate an ephemeral key";
+
+        RSA* rsa = EVP_PKEY_get1_RSA(rsa_2048->GetEvpPkey());
+        if (!rsa) return "failed to extract RSA from the generated key";
+
+        std::shared_ptr<RSA> key(rsa, RSA_free);
+        const std::string fingerprint = hash_key(key.get());
+        {
+            std::lock_guard<std::mutex> lock(g_keys_mutex);
+            g_keys[fingerprint] = key;
+        }
+        LOG(INFO) << "generated ephemeral key with fingerprint "
+                  << SHA256BitsToHexString(fingerprint);
+
+        if (!config.save_generated_key_to.empty()) {
+            // Записываем тем же способом, что и generate_key(): приватный ключ
+            // PEM'ом и публичный рядом в .pub.
+            std::string pubkey;
+            if (!adb::crypto::CalculatePublicKey(&pubkey, rsa)) {
+                return "cannot calculate public key for save_generated_key_to";
+            }
+
+            const mode_t old_mask = umask(077);
+            std::unique_ptr<FILE, decltype(&fclose)> f(
+                    fopen(config.save_generated_key_to.c_str(), "w"), &fclose);
+            umask(old_mask);
+            if (!f) return "cannot open '" + config.save_generated_key_to + "' for writing";
+
+            if (!PEM_write_PrivateKey(f.get(), rsa_2048->GetEvpPkey(), nullptr, nullptr, 0, nullptr,
+                                      nullptr)) {
+                return "cannot write generated key to '" + config.save_generated_key_to + "'";
+            }
+            if (!android::base::WriteStringToFile(pubkey,
+                                                 config.save_generated_key_to + ".pub")) {
+                return "cannot write generated public key to '" + config.save_generated_key_to +
+                       ".pub'";
+            }
+        }
+    }
+
+    return {};
 }
 
 static void send_auth_publickey(atransport* t) {

@@ -1,1 +1,19 @@
 /build/
+
+# Локальный кеш исходников BoringSSL (scripts/fetch-boringssl.sh): ~550 МБ
+# чужого кода, в репозитории ему не место.
+/third_party/boringssl-src/
+
+# Собранные deb-пакеты (make packages): артефакты сборки, не исходники.
+#/packages/
+
+# Каталоги сборки deb-пакетов (debhelper) и их артефакты.
+/obj-*/
+/debian/.debhelper/
+/debian/libadb1/
+/debian/libadb-dev/
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper.log
+/debian/debhelper-build-stamp
+/debian/tmp/

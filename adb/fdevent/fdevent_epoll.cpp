@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2019 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include "fdevent_epoll.h"
 
 #if defined(__linux__)
@@ -108,7 +92,12 @@ void fdevent_context_epoll::Set(fdevent* fde, unsigned events) {
 }
 
 void fdevent_context_epoll::Loop() {
+    // Сбрасываем флаг остановки: libadb позволяет остановить event loop
+    // (Client::shutdown) и снова запустить его (Client::initialize), а без
+    // сброса повторный Loop() вышел бы сразу же на первой проверке.
+    terminate_loop_ = false;
     looper_thread_id_ = android::base::GetThreadId();
+
 
     std::vector<fdevent_event> fde_events;
     std::unordered_map<fdevent*, fdevent_event*> event_map;

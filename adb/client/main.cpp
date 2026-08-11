@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2015 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #define TRACE_TAG ADB
 
 #include "sysdeps.h"
@@ -35,10 +19,7 @@
 #include "adb_auth.h"
 #include "adb_client.h"
 #include "adb_listeners.h"
-#include "adb_mdns.h"
 #include "adb_utils.h"
-#include "adb_wifi.h"
-#include "client/usb.h"
 #include "commandline.h"
 #include "sysdeps/chrono.h"
 #include "transport.h"
@@ -49,9 +30,9 @@
 const char** __adb_argv;
 const char** __adb_envp;
 
-void init_spd_logger() {
-    android::base::LoggerHolder::get_logger();
-}
+// void init_spd_logger() {
+//     android::base::LoggerHolder::get_logger();
+// }
 
 
 static void setup_daemon_logging() {
@@ -94,28 +75,6 @@ static void intentionally_leak() {
 //     device where atransport::MatchesTarget(one_device) is true.
 int adb_server_main(int is_daemon, const std::string& socket_spec, const char* one_device,
                     int ack_reply_fd) {
-#if defined(_WIN32)
-    // adb start-server starts us up with stdout and stderr hooked up to
-    // anonymous pipes. When the C Runtime sees this, it makes stderr and
-    // stdout buffered, but to improve the chance that error output is seen,
-    // unbuffer stdout and stderr just like if we were run at the console.
-    // This also keeps stderr unbuffered when it is redirected to adb.log.
-    if (is_daemon) {
-        if (setvbuf(stdout, nullptr, _IONBF, 0) == -1) {
-            PLOG(FATAL) << "cannot make stdout unbuffered";
-        }
-        if (setvbuf(stderr, nullptr, _IONBF, 0) == -1) {
-            PLOG(FATAL) << "cannot make stderr unbuffered";
-        }
-    }
-
-    // TODO: On Ctrl-C, consider trying to kill a starting up adb server (if we're in
-    // launch_server) by calling GenerateConsoleCtrlEvent().
-
-    // On Windows, SIGBREAK is when Ctrl-Break is pressed or the console window is closed. It should
-    // act like Ctrl-C.
-    signal(SIGBREAK, [](int) { raise(SIGINT); });
-#endif
     signal(SIGINT, [](int) { fdevent_run_on_looper([]() { exit(0); }); });
 
     if (one_device) {
@@ -141,19 +100,7 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, const char* o
 
     init_reconnect_handler();
 
-    if (!getenv("ADB_MDNS") || strcmp(getenv("ADB_MDNS"), "0") != 0) {
-        // init_mdns_transport_discovery();
-    }
-
-    if (!getenv("ADB_USB") || strcmp(getenv("ADB_USB"), "0") != 0) {
-        // if (should_use_libusb()) {
-        //     libusb::usb_init();
-        // } else {
-        //     usb_init();
-        // }
-    } else {
-        adb_notify_device_scan_complete();
-    }
+    adb_notify_device_scan_complete();
 
     if (!getenv("ADB_EMU") || strcmp(getenv("ADB_EMU"), "0") != 0) {
         local_init(android::base::StringPrintf("tcp:%d", DEFAULT_ADB_LOCAL_TRANSPORT_PORT));
@@ -199,28 +146,12 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, const char* o
             // Any error output written to stderr now goes to adb.log. We could
             // keep around a copy of the stderr fd and use that to write any errors
             // encountered by the following code, but that is probably overkill.
-#if defined(_WIN32)
-            const HANDLE ack_reply_handle = cast_int_to_handle(ack_reply_fd);
-            const CHAR ack[] = "OK\n";
-            const DWORD bytes_to_write = arraysize(ack) - 1;
-            DWORD written = 0;
-            if (!WriteFile(ack_reply_handle, ack, bytes_to_write, &written, NULL)) {
-                LOG(FATAL) << "cannot write ACK to handle " << ack_reply_handle
-                           << android::base::SystemErrorCodeToString(GetLastError());
-            }
-            if (written != bytes_to_write) {
-                LOG(FATAL) << "cannot write " << bytes_to_write << " bytes of ACK: only wrote "
-                           << written << " bytes";
-            }
-            CloseHandle(ack_reply_handle);
-#else
             // TODO(danalbert): Can't use SendOkay because we're sending "OK\n", not
             // "OKAY".
             if (!android::base::WriteStringToFd("OK\n", ack_reply_fd)) {
                 PLOG(FATAL) << "error writing ACK to fd " << ack_reply_fd;
             }
             unix_close(ack_reply_fd);
-#endif
         }
         // We don't accept() client connections until this point: this way, clients
         // can't see wonky state early in startup even if they're connecting directly
@@ -252,7 +183,8 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, const char* o
 int main(int argc, char* argv[], char* envp[]) {
     __adb_argv = const_cast<const char**>(argv);
     __adb_envp = const_cast<const char**>(envp);
-    init_spd_logger();
+
     adb_trace_init(argv);
+    
     return adb_commandline(argc - 1, const_cast<const char**>(argv + 1));
 }

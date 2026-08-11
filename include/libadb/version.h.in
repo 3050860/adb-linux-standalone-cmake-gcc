@@ -1,0 +1,15 @@
+/*
+ * libadb — версия библиотеки (файл генерируется CMake из version.h.in).
+ * Не редактировать вручную.
+ */
+#pragma once
+
+#define LIBADB_VERSION_MAJOR  @PROJECT_VERSION_MAJOR@
+#define LIBADB_VERSION_MINOR  @PROJECT_VERSION_MINOR@
+#define LIBADB_VERSION_PATCH  @PROJECT_VERSION_PATCH@
+#define LIBADB_VERSION_STRING "@PROJECT_VERSION@"
+
+/* major<<16 | minor<<8 | patch */
+#define LIBADB_VERSION_NUMBER                                                  \
+    (((@PROJECT_VERSION_MAJOR@) << 16) | ((@PROJECT_VERSION_MINOR@) << 8) |    \
+     (@PROJECT_VERSION_PATCH@))

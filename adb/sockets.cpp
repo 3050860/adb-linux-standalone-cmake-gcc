@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2007 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #define TRACE_TAG SOCKETS
 
 #include "sysdeps.h"
@@ -33,11 +17,6 @@
 #include <vector>
 
 #include <android-base/strings.h>
-
-#if !ADB_HOST
-#include <android-base/properties.h>
-#include <log/log_properties.h>
-#endif
 
 #include "adb.h"
 #include "adb_io.h"
@@ -236,6 +215,7 @@ static bool local_socket_flush_outgoing(asocket* s) {
             } else {
                 D("LS(%u): acks not deferred, blocking", saved_id);
                 fdevent_del(s->fde, FDE_READ);
+
             }
         }
     }
@@ -439,6 +419,7 @@ void local_socket_ack(asocket* s, std::optional<int32_t> acked_bytes) {
         D("LS(%d) received ack", s->id);
         s->ready(s);
     }
+
 }
 
 asocket* create_local_socket(unique_fd ufd) {
@@ -457,11 +438,6 @@ asocket* create_local_socket(unique_fd ufd) {
 }
 
 asocket* create_local_service_socket(std::string_view name, atransport* transport) {
-#if !ADB_HOST
-    if (asocket* s = daemon_service_to_socket(name, transport); s) {
-        return s;
-    }
-#endif
     unique_fd fd = service_to_fd(name, transport);
     if (fd < 0) {
         return nullptr;
@@ -471,15 +447,6 @@ asocket* create_local_service_socket(std::string_view name, atransport* transpor
     asocket* s = create_local_socket(std::move(fd));
     s->transport = transport;
     LOG(VERBOSE) << "LS(" << s->id << "): bound to '" << name << "' via " << fd_value;
-
-#if !ADB_HOST
-    if ((name.starts_with("root:") && getuid() != 0 && __android_log_is_debuggable()) ||
-        (name.starts_with("unroot:") && getuid() == 0) || name.starts_with("usb:") ||
-        name.starts_with("tcpip:")) {
-        D("LS(%d): enabling exit_on_close", s->id);
-        s->exit_on_close = 1;
-    }
-#endif
 
     return s;
 }
@@ -558,12 +525,11 @@ asocket* create_remote_socket(unsigned id, atransport* t) {
 }
 
 void connect_to_remote(asocket* s, std::string_view destination) {
-#if ADB_HOST
     // Snoop reverse:forward: requests to track them so that an
     // appropriate filter (to figure out whether the remote is
     // allowed to connect locally) can be applied.
     s->transport->UpdateReverseConfig(destination);
-#endif
+
     D("Connect_to_remote call RS(%d) fd=%d", s->id, s->fd);
     apacket* p = get_apacket();
 

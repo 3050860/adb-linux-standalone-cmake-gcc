@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2015 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include "sysdeps.h"
 #include "adb_trace.h"
 
@@ -26,79 +10,169 @@
 
 #include "adb.h"
 
-#if !ADB_HOST
-#include <android-base/properties.h>
-#endif
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <mutex>
 
-#if !ADB_HOST
-const char* adb_device_banner = "device";
-#if defined(__ANDROID__)
-static android::base::LogdLogger gLogdLogger;
-#endif
-#else
-const char* adb_device_banner = "host";
-#endif
+constexpr const char* LOG_FILE_PATH = "/tmp/adb.log";
 
+// Вспомогательная функция для маппинга уровней логирования
+static spdlog::level::level_enum MapSeverity(android::base::LogSeverity severity) {
+    switch (severity) {
+        case android::base::VERBOSE: return spdlog::level::trace;
+        case android::base::DEBUG:   return spdlog::level::debug;
+        case android::base::INFO:    return spdlog::level::info;
+        case android::base::WARNING: return spdlog::level::warn;
+        case android::base::ERROR:   return spdlog::level::err;
+        case android::base::FATAL:
+        case android::base::FATAL_WITHOUT_ABORT: return spdlog::level::critical;
+        default: return spdlog::level::info;
+    }
+}
+
+// 2. Конфигурируемый файловый логгер.
+//
+// Настройки задаются через adb_log_configure(); по умолчанию действуют значения
+// AdbLogSettings (историческое поведение adb/adirect), кроме enabled — он берётся
+// из adb_log_default_enabled(), и в libadb.so это false.
+//
+// Пока лог выключен, файл не открывается и не создаётся: sink конструируется
+// лениво, при первой фактической записи.
+
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
+
+namespace {
+
+std::mutex g_log_mutex;
+std::shared_ptr<spdlog::logger> g_logger;
+bool g_logger_dirty = true;
+
+// Настройки живут в куче и намеренно не удаляются: логировать могут статические
+// деструкторы, и порядок уничтожения глобалов не должен приводить к обращению
+// к мёртвому объекту.
+AdbLogSettings& LogSettingsLocked() {
+    static AdbLogSettings* settings = [] {
+        auto* s = new AdbLogSettings();
+        s->enabled = adb_log_default_enabled();
+        return s;
+    }();
+    return *settings;
+}
+
+// Возвращает логгер или nullptr, если лог выключен. Вызывать под g_log_mutex.
+std::shared_ptr<spdlog::logger> GetFileLoggerLocked() {
+    AdbLogSettings& s = LogSettingsLocked();
+    if (!s.enabled) return nullptr;
+    if (g_logger && !g_logger_dirty) return g_logger;
+
+    try {
+        auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                s.file_path, s.max_file_size, s.max_files);
+        auto logger = std::make_shared<spdlog::logger>("adb_file_logger", std::move(sink));
+        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%t] %v");
+        logger->set_level(spdlog::level::trace);
+        logger->flush_on(spdlog::level::debug);
+        g_logger = std::move(logger);
+        g_logger_dirty = false;
+    } catch (const std::exception& e) {
+        // Путь недоступен (нет прав, нет каталога). Процесс не роняем:
+        // выключаем лог и работаем дальше.
+        fprintf(stderr, "adb: cannot open log file %s: %s\n", s.file_path.c_str(), e.what());
+        s.enabled = false;
+        g_logger.reset();
+        g_logger_dirty = true;
+    }
+    return g_logger;
+}
+
+}  // namespace
+
+// Слабое определение: adb и adirect пишут в файл, как раньше. libadb.so
+// переопределяет этот символ (adb/lib/src/api/globals.cpp) и отключает лог.
+__attribute__((weak)) bool adb_log_default_enabled() {
+    return true;
+}
+
+void adb_log_configure(const AdbLogSettings& settings) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    AdbLogSettings& current = LogSettingsLocked();
+    const bool reopen = !settings.enabled || current.file_path != settings.file_path ||
+                        current.max_file_size != settings.max_file_size ||
+                        current.max_files != settings.max_files;
+    current = settings;
+    if (reopen) {
+        g_logger.reset();
+        g_logger_dirty = true;
+    }
+}
+
+AdbLogSettings adb_log_current_settings() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return LogSettingsLocked();
+}
+
+void adb_log_open(const char* reason) {
+    std::shared_ptr<spdlog::logger> logger;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        logger = GetFileLoggerLocked();
+    }
+    if (!logger) return;
+    logger->info("--- log opened: {} ---", reason ? reason : "");
+    logger->flush();
+}
+
+void adb_log_flush() {
+
+    std::shared_ptr<spdlog::logger> logger;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        logger = g_logger;
+    }
+    if (logger) logger->flush();
+}
+
+// 3. Приёмник сообщений libbase: LOG()/VLOG() -> файловый лог.
 void AdbLogger(android::base::LogId id, android::base::LogSeverity severity,
                const char* tag, const char* file, unsigned int line,
                const char* message) {
-    android::base::StderrLogger(id, severity, tag, file, line, message);
-#if defined(_WIN32)
-    // stderr can be buffered on Windows (and setvbuf doesn't seem to work), so explicitly flush.
-    fflush(stderr);
-#endif
-
-#if !ADB_HOST && defined(__ANDROID__)
-    // Only print logs of INFO or higher to logcat, so that `adb logcat` with adbd tracing on
-    // doesn't result in exponential logging.
-    if (severity >= android::base::INFO) {
-        gLogdLogger(id, severity, tag, file, line, message);
-    }
-#endif
-}
-
-
-#if !ADB_HOST
-static std::string get_log_file_name() {
-    struct tm now;
-    time_t t;
-    tzset();
-    time(&t);
-    localtime_r(&t, &now);
-
-    char timestamp[PATH_MAX];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d-%H-%M-%S", &now);
-
-    return android::base::StringPrintf("/data/adb/adb-%s-%d", timestamp,
-                                       getpid());
-}
-
-void start_device_log(void) {
-    int fd = unix_open(get_log_file_name(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
-    if (fd == -1) {
-        return;
+    std::shared_ptr<spdlog::logger> logger;
+    bool also_stderr = false;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        logger = GetFileLoggerLocked();
+        also_stderr = LogSettingsLocked().also_stderr;
     }
 
-    // Redirect stdout and stderr to the log file.
-    dup2(fd, STDOUT_FILENO);
-    dup2(fd, STDERR_FILENO);
-    fprintf(stderr, "--- adb starting (pid %d) ---\n", getpid());
-    unix_close(fd);
+    if (also_stderr) {
+        android::base::StderrLogger(id, severity, tag, file, line, message);
+    }
+    if (!logger) return;
+
+    logger->log(MapSeverity(severity), "[{}:{}] [{}] {}", file ? file : "unknown", line,
+                tag ? tag : "GLOBAL", message ? message : "");
 }
-#endif
+
+
+const char* adb_device_banner = "host";
+
+// void AdbLogger(android::base::LogId id, android::base::LogSeverity severity,
+//                const char* tag, const char* file, unsigned int line,
+//                const char* message) {
+//     android::base::StderrLogger(id, severity, tag, file, line, message);
+// }
 
 int adb_trace_mask;
 
 std::string get_trace_setting() {
-#if ADB_HOST || !defined(__ANDROID__)
     const char* setting = getenv("ADB_TRACE");
     if (setting == nullptr) {
         setting = "";
     }
     return setting;
-#else
-    return android::base::GetProperty("persist.adb.trace_mask", "");
-#endif
 }
 
 // Split the space separated list of tags from the trace setting and build the
@@ -154,17 +228,8 @@ static void setup_trace_mask() {
 }
 
 void adb_trace_init(char** argv) {
-#if !ADB_HOST
-    // Don't open log file if no tracing, since this will block
-    // the crypto unmount of /data
-    if (!get_trace_setting().empty()) {
-        if (unix_isatty(STDOUT_FILENO) == 0) {
-            start_device_log();
-        }
-    }
-#endif
 
-#if ADB_HOST && !defined(_WIN32)
+
     // adb historically ignored $ANDROID_LOG_TAGS but passed it through to logcat.
     // If set, move it out of the way so that libbase logging doesn't try to parse it.
     std::string log_tags;
@@ -173,17 +238,12 @@ void adb_trace_init(char** argv) {
         log_tags = ANDROID_LOG_TAGS;
         unsetenv("ANDROID_LOG_TAGS");
     }
-#endif
 
     android::base::InitLogging(argv, &AdbLogger);
-
-#if ADB_HOST && !defined(_WIN32)
-    // Put $ANDROID_LOG_TAGS back so we can pass it to logcat.
+    // Ensure LOG(INFO) messages pass through libbase filter to AdbLogger
+    android::base::SetMinimumLogSeverity(android::base::INFO);
     if (!log_tags.empty()) setenv("ANDROID_LOG_TAGS", log_tags.c_str(), 1);
-#endif
-
     setup_trace_mask();
-
     VLOG(ADB) << adb_version();
 }
 

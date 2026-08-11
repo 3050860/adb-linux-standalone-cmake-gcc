@@ -2,48 +2,125 @@ cmake_minimum_required(VERSION 3.25)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(ADB)
+project(ADB VERSION 1.0.0)
 
 include(ExternalProject)
-ExternalProject_Add(boringssl
-    GIT_REPOSITORY "https://github.com/google/boringssl.git"
-    GIT_TAG "0.20251002.0"
-    SOURCE_DIR "${PROJECT_BINARY_DIR}/external/boringssl"
-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl -DCMAKE_CXX_FLAGS="-fPIC" -DBUILD_SHARED_LIBS=1
+# BoringSSL собираем ТОЛЬКО статически (этап 12, часть 2 плана).
+#
+# Разделяемый вариант непригоден для распространения: SONAME у него — ровно
+# libssl.so / libcrypto.so, то есть те же имена, что у системного OpenSSL.
+# Поставить такое в /usr/lib значит рисковать сломать сторонний софт, а держать
+# рядом с приложением — тянуть RUNPATH и путаться с загрузчиком.
+# -fPIC обязателен: статические объекты попадают внутрь libadb.so.
+set(BORINGSSL_GIT_TAG "0.20251002.0" CACHE STRING "BoringSSL tag to build")
+
+# Готовое дерево исходников BoringSSL. Если задано, git не вызывается вообще:
+# сборка становится offline и не тратит минуты на клон 500+ МБ репозитория при
+# каждой пересборке (в частности, при сборке deb-пакетов — см. debian/rules).
+# Подготовить кеш: bash scripts/fetch-boringssl.sh
+set(BORINGSSL_SOURCE_DIR "" CACHE PATH
+    "Pre-cloned BoringSSL source tree; empty = clone from git during build")
+
+if (BORINGSSL_SOURCE_DIR AND NOT EXISTS "${BORINGSSL_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "BORINGSSL_SOURCE_DIR=${BORINGSSL_SOURCE_DIR} does not look like a "
+        "BoringSSL checkout (no CMakeLists.txt). Run scripts/fetch-boringssl.sh")
+endif()
+
+# Общие аргументы для обеих ветвей (кеш / клон).
+#
+# BUILD_TESTING=OFF — самое важное для времени сборки: иначе BoringSSL собирает
+# свои тесты (pki_test, bssl_shim, handshaker, gtest), а это минуты на каждый
+# дистрибутив в `make packages`. Нам нужны только libssl.a и libcrypto.a.
+# Тесты BoringSSL гоняет upstream; наша задача — слинковать библиотеку.
+set(BORINGSSL_CMAKE_ARGS
+    -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    -DBUILD_SHARED_LIBS=0
+    -DBUILD_TESTING=OFF
+    # Некоторые версии gcc (Debian 12: gcc-12, Debian 13: gcc-13) считают
+    # maybe-uninitialized в jitter.cc ошибкой из-за -Werror в самом BoringSSL.
+    # CMAKE_CXX_FLAGS_INIT устанавливается до того, как BoringSSL добавляет свои
+    # флаги, и не может быть перезаписан — в отличие от CMAKE_CXX_FLAGS.
+    -DCMAKE_CXX_FLAGS_INIT=-Wno-maybe-uninitialized
+    -DCMAKE_C_FLAGS_INIT=-Wno-maybe-uninitialized
 )
+set(BORINGSSL_BYPRODUCTS
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
+)
+
+if (BORINGSSL_SOURCE_DIR)
+    message(STATUS "BoringSSL: using pre-cloned source ${BORINGSSL_SOURCE_DIR}")
+    # DOWNLOAD_COMMAND "" полностью отключает шаг загрузки; SOURCE_DIR при этом
+    # используется как есть и не модифицируется (сборка out-of-source), поэтому
+    # каталог можно монтировать read-only.
+    ExternalProject_Add(boringssl
+        SOURCE_DIR "${BORINGSSL_SOURCE_DIR}"
+        DOWNLOAD_COMMAND ""
+        UPDATE_COMMAND ""
+        CMAKE_ARGS ${BORINGSSL_CMAKE_ARGS}
+        BUILD_BYPRODUCTS ${BORINGSSL_BYPRODUCTS}
+    )
+else()
+    message(STATUS "BoringSSL: cloning ${BORINGSSL_GIT_TAG} during build "
+                   "(set BORINGSSL_SOURCE_DIR to build offline)")
+    ExternalProject_Add(boringssl
+        GIT_REPOSITORY "https://github.com/google/boringssl.git"
+        GIT_TAG "${BORINGSSL_GIT_TAG}"
+        GIT_SHALLOW TRUE
+        SOURCE_DIR "${PROJECT_BINARY_DIR}/external/boringssl"
+        CMAKE_ARGS ${BORINGSSL_CMAKE_ARGS}
+        BUILD_BYPRODUCTS ${BORINGSSL_BYPRODUCTS}
+    )
+endif()
 set(BORINGSSL_INCLUDE_DIRS ${PROJECT_BINARY_DIR}/lib/boringssl/include)
 set(BORINGSSL_LIBRARIES
-    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.so
-    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.so
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
 )
 
 include(CheckFunctionExists)
 find_package(PkgConfig)
 check_function_exists(strlcpy HAVE_STRLCPY)
 
+# strlcpy появился в glibc только с версии 2.38 (Ubuntu 24.04+). На Debian 12
+# (glibc 2.36) и других системах постарше его нет, и функция берётся из libbsd.
+#
+# REQUIRED здесь стоять НЕ должен: с ним pkg_check_modules прерывает
+# конфигурацию своим сообщением («A required package was not found»), ветка
+# else() становится мёртвым кодом, и вместо внятного объяснения пользователь
+# видит стек вызовов внутри FindPkgConfig.cmake.
 if (NOT HAVE_STRLCPY)
-    pkg_check_modules(LIBBSD REQUIRED libbsd)
+    pkg_check_modules(LIBBSD libbsd)
     if (LIBBSD_FOUND)
+        message(STATUS "strlcpy: taken from libbsd ${LIBBSD_VERSION}")
         set(NEED_LIBBSD TRUE)
+        # pkg_check_modules отдаёт в LIBBSD_LIBRARIES голое имя ("bsd") без -L.
+        # В стандартном пути линковщик его найдёт, но если libbsd лежит в другом
+        # префиксе — нет. Добавляем каталоги поиска явно.
+        link_directories(${LIBBSD_LIBRARY_DIRS})
     else()
-        message(WARNING "strlcpy not found in standard library, and libbsd is not available. You may need to install libbsd-dev.")
+        message(FATAL_ERROR
+            "strlcpy отсутствует в libc этой системы (glibc < 2.38), а libbsd не найдена.\n"
+            "Установите пакет разработки libbsd:\n"
+            "    Debian/Ubuntu: apt-get install libbsd-dev\n"
+            "Проверить наличие: pkg-config --modversion libbsd")
     endif()
 endif()
 
 find_package(spdlog REQUIRED)
 find_package(fmt REQUIRED)
 
-add_compile_options(-Wall -Wextra -Wno-error -Wno-non-virtual-dtor -Wno-unknown-pragmas -Wno-attributes -Wno-unused-parameter -Wno-missing-field-initializers -Wvla -DADB_HOST=1 -D__linux__=1)
+add_compile_options(-g -O0 -Wall -Wextra -Wno-error -Wno-non-virtual-dtor -Wno-unknown-pragmas -Wno-attributes -Wno-unused-parameter -Wno-missing-field-initializers -Wvla -DADB_HOST=1 -D__linux__=1)
 
 set(SOURCES
     adb/adb.cpp
     adb/adb_io.cpp
     adb/adb_listeners.cpp
-    adb/adb_mdns.cpp
     adb/adb_trace.cpp
     adb/adb_unique_fd.cpp
     adb/adb_utils.cpp
-    adb/fdevent/fdevent.cpp
     adb/services.cpp
     adb/sockets.cpp
     adb/socket_spec.cpp
@@ -52,67 +129,46 @@ set(SOURCES
     adb/transport.cpp
     adb/transport_fd.cpp
     adb/types.cpp
+    adb/shell_service_protocol.cpp
 
     adb/sysdeps_unix.cpp
     adb/sysdeps/posix/network.cpp
 
+    adb/fdevent/fdevent.cpp
     adb/fdevent/fdevent_epoll.cpp
-
-    # adb/client/openscreen/mdns_service_info.cpp
-    # adb/client/openscreen/mdns_service_watcher.cpp
-    # adb/client/openscreen/platform/logging.cpp
-    # adb/client/openscreen/platform/task_runner.cpp
-    # adb/client/openscreen/platform/udp_socket.cpp
-
-    adb/client/auth.cpp
-    # adb/client/adb_wifi.cpp
-    # adb/client/usb_libusb.cpp
-    adb/client/transport_local.cpp
-    #adb/client/mdnsresponder_client.cpp
-    adb/client/mdns_utils.cpp
-    # adb/client/transport_mdns.cpp
-    # adb/client/transport_usb.cpp
-    # adb/client/pairing/pairing_client.cpp
-    adb/client/main.cpp
-    adb/client/adb_client.cpp
-    # adb/client/commandline.cpp
-    # adb/client/usb_linux.cpp
 
     adb/crypto/key.cpp
     adb/crypto/rsa_2048_key.cpp
     adb/crypto/x509_generator.cpp
+
     adb/tls/adb_ca_list.cpp
     adb/tls/tls_connection.cpp
 
+    adb/client/auth.cpp
+    adb/client/transport_local.cpp
+    
     adb/client/adb_client.cpp
     adb/client/bugreport.cpp
     adb/client/commandline.cpp
     adb/client/file_sync_client.cpp
-    adb/client/main.cpp
     adb/client/console.cpp
     adb/client/adb_install.cpp
     adb/client/line_printer.cpp
-    # adb/client/fastdeploy.cpp
-    # adb/client/fastdeploycallbacks.cpp
+
     adb/client/incremental.cpp
     adb/client/incremental_server.cpp
     adb/client/incremental_utils.cpp
-    adb/shell_service_protocol.cpp
 
 )
 # find_package(OpenSSL REQUIRED)
 find_package(Protobuf REQUIRED)
 #find_package(PkgConfig REQUIRED)
-
 #pkg_check_modules(LIBBSD REQUIRED libbsd)
-
 #pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 pkg_check_modules(BROTLI REQUIRED libbrotlicommon libbrotlienc libbrotlidec)
 pkg_check_modules(LZ4 REQUIRED liblz4)
 pkg_check_modules(ZSTD REQUIRED libzstd)
-
 #include_directories(${LIBUSB_INCLUDE_DIRS})
-
 #message("LIBUSB_INCLUDE_DIRS: ${LIBUSB_INCLUDE_DIRS}")
 #message("LIBBSD_LIBRARIES: ${LIBBSD_LIBRARIES}")
 
@@ -138,20 +194,105 @@ add_custom_command(
     COMMENT "Generating protobuf files for ApkEntry.proto"
 )
 
-
-
-
 protobuf_generate_cpp(KEY_TYPE_PROTO_SRCS KEY_TYPE_PROTO_HDRS adb/proto/key_type.proto)
 protobuf_generate_cpp(DEVICES_PROTO DEVICES_PROTO_HDRS adb/proto/devices.proto)
 protobuf_generate_cpp(APP APP_HDRS adb/proto/app_processes.proto)
 # protobuf_generate_cpp(FASTDEPLOY FASTDEPLOY_H adb/fastdeploy/profo)
 set(SOURCES ${SOURCES} 
-    ${APK_PROTO_SRCS} ${KEY_TYPE_PROTO_SRCS}
+    ${APK_PROTO_SRCS} 
+    ${KEY_TYPE_PROTO_SRCS}
     ${DEVICES_PROTO}
     ${APP}
 )
+set(ADIRECT_SOURCES
+    adb/adb.cpp
+    adb/adb_io.cpp
+    adb/adb_listeners.cpp
+    adb/adb_trace.cpp
+    adb/adb_unique_fd.cpp
+    adb/adb_utils.cpp
+    adb/services.cpp
+    adb/sockets.cpp
+    adb/socket_spec.cpp
+    adb/sysdeps/env.cpp
+    adb/sysdeps/errno.cpp
+    adb/transport.cpp
+    adb/transport_fd.cpp
+    adb/types.cpp
+    adb/shell_service_protocol.cpp
+
+    adb/sysdeps_unix.cpp
+    adb/sysdeps/posix/network.cpp
+
+    adb/fdevent/fdevent.cpp
+    adb/fdevent/fdevent_epoll.cpp
+
+    adb/crypto/key.cpp
+    adb/crypto/rsa_2048_key.cpp
+    adb/crypto/x509_generator.cpp
+
+    adb/tls/adb_ca_list.cpp
+    adb/tls/tls_connection.cpp
+
+    adb/client/auth.cpp
+    adb/client/transport_local.cpp
+    
+    adb/lib/src/adb_client.cpp
+    # adb/client/bugreport.cpp
+    # adb/client/commandline.cpp
+    adb/lib/src/file_sync_client.cpp
+    adb/lib/src/helpers.cpp
+    adb/client/console.cpp
+    adb/lib/src/adb_install.cpp
+    adb/client/line_printer.cpp
+
+    adb/client/incremental.cpp
+    adb/client/incremental_server.cpp
+    adb/client/incremental_utils.cpp
+
+    ${APK_PROTO_SRCS} 
+    ${KEY_TYPE_PROTO_SRCS}
+    ${DEVICES_PROTO}
+    ${APP}
+
+    adb/lib/src/AdbDevice.cpp
+    adb/lib/src/AdbManager.cpp
+    adb/lib/src/AdbSession.cpp
+    adb/lib/src/AdbFileSync.cpp
+    adb/lib/src/AdbInstaller.cpp
+    adb/lib/src/adirect.cpp
+)
+set(SOURCES ${SOURCES}
+    adb/client/main.cpp
+)
+add_executable(adirect ${ADIRECT_SOURCES})
+target_include_directories(adirect PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/adb
+    ${CMAKE_SOURCE_DIR}/adb/client
+    ${CMAKE_SOURCE_DIR}/adb/crypto/include
+    ${CMAKE_SOURCE_DIR}/adb/tls/include
+    ${CMAKE_SOURCE_DIR}/adb/client
+    ${CMAKE_SOURCE_DIR}/system/libbase/include
+    ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_BINARY_DIR}/lib/boringssl/include
+    ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
+    ${CMAKE_SOURCE_DIR}/third_party/libcrypto_utils/include
+    ${CMAKE_SOURCE_DIR}/system/libziparchive/include
+    ${CMAKE_SOURCE_DIR}/adb/lib/include
+)
+target_link_libraries(adirect PRIVATE
+    ${BORINGSSL_LIBRARIES}
+    diagnose_usb crypto_utils build cutils log ziparchive
+    ${Protobuf_LIBRARIES}
+    ${BROTLI_LIBRARIES}
+    ${LZ4_LIBRARIES}
+    ${ZSTD_LIBRARIES}
+)
 
 add_executable(adb ${SOURCES})
+
 target_compile_definitions(adb PRIVATE ANDROID_BASE_UNIQUE_FD_DISABLE_IMPLICIT_CONVERSION=1)
 target_include_directories(adb PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -162,9 +303,6 @@ target_include_directories(adb PRIVATE
     ${CMAKE_SOURCE_DIR}/adb/client   # client/*.h
     ${CMAKE_SOURCE_DIR}/system/libbase/include
     ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
-    # ${CMAKE_SOURCE_DIR}/external/openscreen/include
-    # ${CMAKE_SOURCE_DIR}/external/openscreen/platform/api
-    # ${CMAKE_SOURCE_DIR}/external/openscreen
     ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_BINARY_DIR}/lib/boringssl/include
 #    ${LIBBSD_INCLUDE_DIRS}
@@ -172,20 +310,9 @@ target_include_directories(adb PRIVATE
 add_subdirectory(libbuildversion build)
 add_subdirectory(system/core/diagnose_usb diagnose_usb)
 add_subdirectory(system/libbase base)
-
 add_subdirectory(system/libziparchive ziparchive)
-#add_subdirectory(third_party/boringssl/src)
 add_subdirectory(third_party/libcrypto_utils crypto_utils)
-# add_subdirectory(third_party/openscreen/src)
-# include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src/platform/api)
-# include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src)
-# include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/openscreen/src/discovery/dnssd/public)  # Для dnssd
 
-# Список исходников для libcutils
-file(GLOB LIBCUTILS_SOURCES1
-    "system/core/libcutils/*.c"
-    "system/core/libcutils/*.cpp"
-)
 set(LIBCUTILS_SOURCES
 system/core/libcutils/android_get_control_file.cpp
 system/core/libcutils/android_reboot.cpp
@@ -221,18 +348,16 @@ system/core/libcutils/uevent.cpp
 )
 # Создаем статическую библиотеку
 add_library(cutils STATIC ${LIBCUTILS_SOURCES})
-# Указываем директории с заголовками
+
 target_include_directories(cutils PRIVATE
     ${CMAKE_SOURCE_DIR}/system/libbase/include
     ${CMAKE_SOURCE_DIR}/system/liblog/include
     ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
 )
-# Определяем макросы для хоста
 target_compile_definitions(cutils PRIVATE
     -DADB_HOST=1
     -D_GLIBCXX_USE_CXX11_ABI=1
 )
-
 target_link_libraries(cutils base)
 
 add_subdirectory(system/liblog log)
@@ -240,14 +365,14 @@ add_subdirectory(system/core/libutils utils)
 
 target_link_libraries(adb PRIVATE
     ${BORINGSSL_LIBRARIES}
-    diagnose_usb crypto ssl crypto_utils build cutils ziparchive
+    diagnose_usb crypto_utils build cutils log ziparchive
 #    ${LIBUSB_LIBRARIES}
     ${Protobuf_LIBRARIES}
     ${BROTLI_LIBRARIES}
     ${LZ4_LIBRARIES}
     ${ZSTD_LIBRARIES}
 #    ${LIBBSD_LIBRARIES}
-)  # Линковка
+)
 target_include_directories(adb PRIVATE 
     ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
     ${CMAKE_SOURCE_DIR}/third_party/libcrypto_utils/include
@@ -256,31 +381,215 @@ target_include_directories(adb PRIVATE
 
 if (NEED_LIBBSD)
     target_include_directories(adb PRIVATE ${LIBBSD_INCLUDE_DIRS})
+    target_include_directories(adirect PRIVATE ${LIBBSD_INCLUDE_DIRS})
     target_link_libraries(adb PRIVATE ${LIBBSD_LIBRARIES})
+    target_link_libraries(adirect PRIVATE ${LIBBSD_LIBRARIES})
 endif()
 target_link_libraries(adb PRIVATE spdlog::spdlog fmt::fmt)
+target_link_libraries(adirect PRIVATE spdlog::spdlog fmt::fmt)
 
 target_include_directories(ziparchive PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 
-# Инсталляция adb
-set(CMAKE_INSTALL_PREFIX /opt)
+# Инсталляция adb.
+#
+# Префикс по умолчанию — /opt (историческое поведение этого проекта: adb и его
+# .so ставились в /opt/adb). Но жёсткий set() ломал бы упаковку в deb, где
+# префикс обязан быть /usr, поэтому уважаем значение, заданное извне
+# (-DCMAKE_INSTALL_PREFIX=... или CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT).
+if (CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX /opt CACHE PATH "install prefix" FORCE)
+endif()
+
+# Консольные утилиты ставим только когда это явно попросили: deb-пакеты
+# libadb1/libadb-dev содержат исключительно библиотеку и заголовки.
+option(LIBADB_INSTALL_TOOLS "Install the adb/adirect command line tools" ON)
+
+if (LIBADB_INSTALL_TOOLS)
 install(TARGETS adb
     RUNTIME DESTINATION adb
 )
+endif()
 
-# Установка динамических библиотек
-install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/lib/boringssl/lib/libssl.so
-    ${CMAKE_CURRENT_BINARY_DIR}/lib/boringssl/lib/libcrypto.so
-    ${CMAKE_CURRENT_BINARY_DIR}/ziparchive/libziparchive.so
-    DESTINATION adb/lib
-)
+# Установки libssl.so/libcrypto.so/libziparchive.so больше нет: после этапа 12
+# все три линкуются статически внутрь adb и libadb.so, отдельных файлов не
+# существует. Это же убрало необходимость в rpath на каталог adb/lib.
 
 # Настройка RPATH для автоматического поиска библиотек
 set_target_properties(adb PROPERTIES
     BUILD_RPATH "$ORIGIN/lib"
     INSTALL_RPATH "$ORIGIN/lib"
 )
+
+# ---------------------------------------------------------------------------
+# libadb.so — библиотека прямого управления устройствами
+#
+# adb_core  : STATIC (-fPIC) — весь код adb, кроме точек входа консольных
+#             клиентов (adirect.cpp / client/main.cpp).
+# adb_shared: SHARED — только фасад публичного API; наружу видны лишь
+#             символы libadb (см. adb/lib/libadb.map).
+#
+# Цели adb и adirect не затрагиваются: они по-прежнему собираются из своих
+# собственных списков исходников.
+# ---------------------------------------------------------------------------
+
+# Заголовок с версией
+configure_file(
+    ${CMAKE_SOURCE_DIR}/include/libadb/version.h.in
+    ${CMAKE_BINARY_DIR}/include/libadb/version.h
+    @ONLY
+)
+
+set(LIBADB_CORE_SOURCES ${ADIRECT_SOURCES})
+list(REMOVE_ITEM LIBADB_CORE_SOURCES adb/lib/src/adirect.cpp)
+
+add_library(adb_core STATIC ${LIBADB_CORE_SOURCES})
+add_dependencies(adb_core boringssl)
+set_target_properties(adb_core PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+target_include_directories(adb_core PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/adb
+    ${CMAKE_SOURCE_DIR}/adb/client
+    ${CMAKE_SOURCE_DIR}/adb/crypto/include
+    ${CMAKE_SOURCE_DIR}/adb/tls/include
+    ${CMAKE_SOURCE_DIR}/system/libbase/include
+    ${CMAKE_SOURCE_DIR}/system/core/libcutils/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_BINARY_DIR}/lib/boringssl/include
+    ${CMAKE_SOURCE_DIR}/system/core/diagnose_usb
+    ${CMAKE_SOURCE_DIR}/third_party/libcrypto_utils/include
+    ${CMAKE_SOURCE_DIR}/system/libziparchive/include
+    ${CMAKE_SOURCE_DIR}/adb/lib/include
+)
+target_link_libraries(adb_core PUBLIC
+    ${BORINGSSL_LIBRARIES}
+    diagnose_usb crypto_utils build cutils log ziparchive
+    ${Protobuf_LIBRARIES}
+    ${BROTLI_LIBRARIES}
+    ${LZ4_LIBRARIES}
+    ${ZSTD_LIBRARIES}
+    spdlog::spdlog fmt::fmt
+    pthread dl
+)
+if (NEED_LIBBSD)
+    target_include_directories(adb_core PUBLIC ${LIBBSD_INCLUDE_DIRS})
+    target_link_libraries(adb_core PUBLIC ${LIBBSD_LIBRARIES})
+endif()
+
+set(LIBADB_API_SOURCES
+    adb/lib/src/api/globals.cpp
+    adb/lib/src/api/version.cpp
+    adb/lib/src/api/status.cpp
+    adb/lib/src/api/device_address.cpp
+    adb/lib/src/api/log.cpp
+    adb/lib/src/api/events.cpp
+    adb/lib/src/api/operation.cpp
+    adb/lib/src/api/device.cpp
+    adb/lib/src/api/client.cpp
+)
+
+
+add_library(adb_shared SHARED ${LIBADB_API_SOURCES})
+target_include_directories(adb_shared PRIVATE ${CMAKE_SOURCE_DIR}/adb/lib/src)
+
+set_target_properties(adb_shared PROPERTIES
+    OUTPUT_NAME adb
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+target_link_libraries(adb_shared PRIVATE adb_core)
+# Наружу — только то, что перечислено в version script.
+target_link_options(adb_shared PRIVATE
+    -Wl,--version-script=${CMAKE_SOURCE_DIR}/adb/lib/libadb.map
+    -Wl,--exclude-libs,ALL
+)
+set_target_properties(adb_shared PROPERTIES
+    LINK_DEPENDS ${CMAKE_SOURCE_DIR}/adb/lib/libadb.map
+)
+
+# ---------------------------------------------------------------------------
+# Установка libadb: заголовки, .so, pkg-config, CMake-конфиг (этап 11)
+#
+# Потребителю доступны два способа подключения:
+#   pkg-config --cflags --libs libadb
+#   find_package(libadb 1.0 REQUIRED) + target_link_libraries(app libadb::adb)
+# ---------------------------------------------------------------------------
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# Пути к заголовкам разные для сборки и для установки: в дереве исходников их
+# два каталога (include/ и сгенерированный build/include/), после установки —
+# один ${CMAKE_INSTALL_INCLUDEDIR}.
+target_include_directories(adb_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+# EXPORT_NAME: внутренний таргет называется adb_shared, но потребителю обещан
+# libadb::adb (§13.4). Без этого экспортировался бы libadb::adb_shared, и
+# документированная строка target_link_libraries(app libadb::adb) не работала бы.
+set_target_properties(adb_shared PROPERTIES EXPORT_NAME adb)
+
+# Тот же псевдоним внутри дерева сборки: примеры и тесты подключаются строкой
+# libadb::adb независимо от того, установлена библиотека или нет.
+add_library(libadb::adb ALIAS adb_shared)
+
+install(TARGETS adb_shared
+    EXPORT libadbTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+# Публичные заголовки: рукописные из include/libadb и сгенерированный version.h.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/libadb
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+)
+install(FILES ${CMAKE_BINARY_DIR}/include/libadb/version.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/libadb
+)
+
+install(EXPORT libadbTargets
+    FILE libadbTargets.cmake
+    NAMESPACE libadb::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libadb
+)
+
+configure_package_config_file(
+    ${CMAKE_SOURCE_DIR}/adb/lib/libadbConfig.cmake.in
+    ${CMAKE_BINARY_DIR}/libadbConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libadb
+)
+# SameMajorVersion: C++ API совместим внутри одного MAJOR (см. §13.5).
+write_basic_package_version_file(
+    ${CMAKE_BINARY_DIR}/libadbConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    ${CMAKE_BINARY_DIR}/libadbConfig.cmake
+    ${CMAKE_BINARY_DIR}/libadbConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libadb
+)
+
+configure_file(${CMAKE_SOURCE_DIR}/adb/lib/libadb.pc.in ${CMAKE_BINARY_DIR}/libadb.pc @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/libadb.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)
+
+# Примеры: собираются только при явном запросе (не ломают сборку библиотеки).
+option(BUILD_EXAMPLES "Build examples in examples/" OFF)
+if (BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+

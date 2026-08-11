@@ -1,0 +1,4 @@
+usr/include/libadb
+usr/lib/*/libadb.so
+usr/lib/*/pkgconfig/libadb.pc
+usr/lib/*/cmake/libadb
