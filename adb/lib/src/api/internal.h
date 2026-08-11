@@ -30,5 +30,9 @@ LIBADB_INTERNAL bool log_sink_wants(LogLevel level);
 // Client::set_timeouts() влияет на всё, что начнётся после вызова.
 LIBADB_INTERNAL Timeouts current_timeouts();
 
+// Ставит SIG_IGN на SIGPIPE, если приложение не настроило обработчик само:
+// запись в оборванный сокет должна давать EPIPE, а не убивать процесс.
+LIBADB_INTERNAL void ensure_sigpipe_ignored();
+
 
 }  // namespace libadb::internal

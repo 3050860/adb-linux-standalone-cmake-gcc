@@ -111,11 +111,101 @@ class LIBADB_INTERNAL ProgressThrottle {
     bool first_ = true;
 };
 
-// Контекст одной операции: id, устройство, команда, фаза. Используется
-// device.cpp для событий; на этапе 8 сюда добавится флаг отмены.
+// Флаг отмены одной операции. Живёт в shared_ptr, потому что отменяющий поток
+// может держать ссылку дольше, чем существует сама операция.
+struct LIBADB_INTERNAL CancelFlag {
+    std::atomic<bool> canceled{false};
+
+    // Идентификатор операции, которая подхватила этот флаг. Нужен Operation::id():
+    // сам идентификатор рождается внутри OperationContext, то есть уже в потоке
+    // пула, когда хэндл Operation давно отдан вызывающему.
+    std::atomic<OperationId> operation_id{0};
+
+    // Соединения закрыли принудительно (close_all) — статус отличается от
+    // «я сам отменил» (§9).
+    std::atomic<bool> connection_closed{false};
+
+    bool triggered() const {
+        return canceled.load(std::memory_order_relaxed) ||
+               connection_closed.load(std::memory_order_relaxed);
+    }
+
+    Status status() const {
+        return connection_closed.load(std::memory_order_relaxed) ? Status::ConnectionClosed
+                                                                 : Status::Canceled;
+    }
+};
+using CancelFlagPtr = std::shared_ptr<CancelFlag>;
+
+// Реестр живых операций: по нему работают Client::cancel(id), cancel_all()
+// и close_all(). Один на процесс.
+class LIBADB_INTERNAL OperationRegistry {
+  public:
+    static OperationRegistry& instance();
+
+    // Регистрирует операцию. serial нужен, чтобы close_all() мог отменить
+    // операции конкретного устройства.
+    void add(OperationId id, const std::string& serial, const CancelFlagPtr& flag);
+    void remove(OperationId id);
+
+    // true — операция найдена и помечена отменённой.
+    bool cancel(OperationId id);
+    size_t cancel_all();
+
+    // Отмена всех операций одного устройства (Device::cancel_current).
+    size_t cancel_serial(const std::string& serial);
+
+    // Отмена всех операций устройства (пустой serial — всех вообще) с
+    // причиной ConnectionClosed.
+    size_t close(const std::string& serial);
+
+    size_t size() const;
+
+  private:
+    struct Entry {
+        std::string serial;
+        CancelFlagPtr flag;
+    };
+
+    mutable std::mutex mutex_;
+    std::unordered_map<OperationId, Entry> operations_;
+};
+
+// Флаг отмены, приготовленный для следующей операции в этом потоке.
+//
+// Зачем так: асинхронный воркер вызывает те же самые публичные
+// Device::push/shell/... , у которых нет параметра «флаг отмены» (добавлять его
+// в публичный ABI ради этого не хочется). Воркер ставит флаг на свой поток, а
+// OperationContext его подхватывает и обнуляет — то есть флаг достаётся ровно
+// одной, самой внешней операции.
+class LIBADB_INTERNAL PendingCancelFlag {
+  public:
+    explicit PendingCancelFlag(CancelFlagPtr flag);
+    ~PendingCancelFlag();
+
+    // Забирает приготовленный флаг (и снимает его), либо nullptr.
+    static CancelFlagPtr take();
+
+  private:
+    CancelFlagPtr previous_;
+};
+
+// Контекст одной операции: id, устройство, команда, фаза, флаг отмены.
+// Регистрируется в OperationRegistry на время жизни объекта.
 class LIBADB_INTERNAL OperationContext {
   public:
-    OperationContext(Command command, std::string serial);
+    // flag != nullptr — использовать готовый флаг отмены (его создаёт
+    // Operation::Impl, чтобы cancel() работал ещё до старта воркера).
+    OperationContext(Command command, std::string serial, CancelFlagPtr flag = nullptr);
+    ~OperationContext();
+
+    // Отмена запрошена (пользователем или close_all)?
+    bool canceled() const { return flag_->triggered(); }
+
+    // Статус отмены: Canceled или ConnectionClosed.
+    Status cancel_status() const { return flag_->status(); }
+
+    const CancelFlagPtr& cancel_flag() const { return flag_; }
 
     OperationId id() const { return id_; }
     Command command() const { return command_; }
@@ -147,6 +237,7 @@ class LIBADB_INTERNAL OperationContext {
     Phase phase_ = Phase::None;
     std::chrono::steady_clock::time_point started_;
     ProgressThrottle throttle_;
+    CancelFlagPtr flag_;
 };
 
 // Событие уровня устройства/клиента одной строкой.

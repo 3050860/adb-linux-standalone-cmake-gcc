@@ -412,6 +412,11 @@ struct Options {
     // больше max_connections устройств. 0 — без ограничения.
     size_t max_connections = 0;
 
+    // Отдельный пул для *_async (§9). Важное следствие, о котором надо помнить
+    // при смешанном использовании: число одновременно открытых подключений
+    // складывается из обоих пулов, а лимитом сверху остаётся max_connections.
+    size_t async_worker_threads = 4;
+
     // --- события (§8) ---
 
     // Базовый подписчик: то же, что Client::subscribe(on_event, event_mask),
@@ -432,6 +437,81 @@ struct Options {
 
 
 // ---------------------------------------------------------------------------
+// Асинхронные операции (§9)
+// ---------------------------------------------------------------------------
+
+// Детали реализации: фабрики, создающие Operation/BatchOperation (конструкторы
+// приватные). Определены внутри библиотеки, приложению не нужны.
+namespace internal {
+struct OperationFactory;
+}
+
+// Хэндл асинхронной операции. Живёт независимо от Device: если вызывающий
+// отпустил Device, операция всё равно доработает (Device держится изнутри).
+class LIBADB_API Operation {
+  public:
+    ~Operation();
+    Operation(const Operation&) = delete;
+    Operation& operator=(const Operation&) = delete;
+
+    // 0, пока воркер не начал работу (идентификатор выдаётся в момент старта);
+    // после этого — тот же id, что приходит в событиях и в on_start.
+    OperationId id() const;
+    Command command() const;
+    const std::string& serial() const;
+
+    bool done() const;
+    Phase phase() const;
+
+    // timeout == 0 — ждать бесконечно. false — не дождались.
+    bool wait(ms timeout = ms{0}) const;
+
+    // Валиден после done(); до этого — пустой Result со Status::Ok.
+    Result result() const;
+
+    // Идемпотентно, из любого потока.
+    void cancel();
+    bool canceled() const;
+
+    struct Impl;
+
+  private:
+    friend struct internal::OperationFactory;
+    explicit Operation(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+using OperationPtr = std::shared_ptr<Operation>;
+
+// Групповая асинхронная операция: набор Operation по списку адресов.
+class LIBADB_API BatchOperation {
+  public:
+    ~BatchOperation();
+    BatchOperation(const BatchOperation&) = delete;
+    BatchOperation& operator=(const BatchOperation&) = delete;
+
+    bool wait(ms timeout = ms{0}) const;
+    bool done() const;
+    size_t total() const;
+    size_t finished() const;
+
+    // Готовые на момент вызова результаты; ключ — адрес из входного списка.
+    std::map<std::string, Result> results() const;
+
+    // Для точечной отмены.
+    std::vector<OperationPtr> operations() const;
+
+    void cancel();
+
+    struct Impl;
+
+  private:
+    friend struct internal::OperationFactory;
+    explicit BatchOperation(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+using BatchOperationPtr = std::shared_ptr<BatchOperation>;
+
+// ---------------------------------------------------------------------------
 // Устройство
 // ---------------------------------------------------------------------------
 
@@ -446,7 +526,10 @@ struct DeviceFactory;
 // Живое подключение к одному устройству. Создаётся только через Client.
 
 // Методы блокирующие; объект можно использовать из одного потока за раз.
-class LIBADB_API Device {
+// enable_shared_from_this: асинхронная операция должна продлевать жизнь
+// устройства, иначе вызывающий, отпустивший DevicePtr, снёс бы объект
+// из-под работающего воркера.
+class LIBADB_API Device : public std::enable_shared_from_this<Device> {
   public:
     ~Device();
     Device(const Device&) = delete;
@@ -468,6 +551,27 @@ class LIBADB_API Device {
 
     Result install(const std::string& apk_path, const InstallOptions& options = {});
     Result uninstall(const std::string& package, const UninstallOptions& options = {});
+
+    // --- асинхронный режим (§9) ---
+    //
+    // Работа уходит в отдельный пул библиотеки (Options::async_worker_threads).
+    // Второй *_async на занятом устройстве вернёт операцию, уже завершённую со
+    // Status::DeviceBusy: последовательность команд на одном устройстве —
+    // забота вызывающего.
+    OperationPtr push_async(const std::string& local, const std::string& remote,
+                            const PushOptions& options = {});
+    OperationPtr pull_async(const std::string& remote, const std::string& local,
+                            const PullOptions& options = {});
+    OperationPtr shell_async(const std::string& command, const ShellOptions& options = {});
+    OperationPtr install_async(const std::string& apk_path, const InstallOptions& options = {});
+    OperationPtr uninstall_async(const std::string& package, const UninstallOptions& options = {});
+
+    // Занято ли устройство асинхронной операцией прямо сейчас.
+    bool busy() const;
+
+    // Отменяет операции этого устройства (и синхронные, и асинхронные).
+    // Возвращает число помеченных операций.
+    size_t cancel_current();
 
     // getprop одним вызовом; std::nullopt, если свойство отсутствует.
     std::optional<std::string> get_prop(const std::string& name);
@@ -570,7 +674,41 @@ class LIBADB_API Client {
     void set_log_level(LogLevel level);
     void set_log_sink(LogSink sink);
 
-    // Закрывает все подключения; клиент остаётся работоспособным.
+    // --- асинхронные групповые операции (§9) ---
+
+    BatchOperationPtr push_all_async(const std::vector<std::string>& addresses,
+                                     const std::string& local, const std::string& remote,
+                                     const PushOptions& options = {});
+    BatchOperationPtr pull_all_async(const std::vector<std::string>& addresses,
+                                     const std::string& remote, const std::string& local_dir,
+                                     const PullOptions& options = {});
+    BatchOperationPtr shell_all_async(const std::vector<std::string>& addresses,
+                                      const std::string& command,
+                                      const ShellOptions& options = {});
+    BatchOperationPtr install_all_async(const std::vector<std::string>& addresses,
+                                        const std::string& apk_path,
+                                        const InstallOptions& options = {});
+    BatchOperationPtr uninstall_all_async(const std::vector<std::string>& addresses,
+                                          const std::string& package,
+                                          const UninstallOptions& options = {});
+
+    // --- отмена (§9) ---
+
+    // Отменяет операцию по идентификатору (полученному через on_start или
+    // событие OperationStarted). true — операция найдена и помечена.
+    // Завершение — в пределах сотен миллисекунд, «мгновенно» не обещаем.
+    bool cancel(OperationId id);
+
+    // Отменяет все текущие операции; соединения остаются открытыми.
+    // Возвращает число помеченных операций.
+    size_t cancel_all();
+
+    // Сколько операций выполняется прямо сейчас (синхронных и асинхронных).
+    size_t active_operations() const;
+
+    // Закрывает все подключения; клиент остаётся работоспособным. Текущие
+    // операции завершаются со Status::ConnectionClosed — это отдельный код,
+    // отличимый от Canceled («я сам отменил»).
     void close_all();
 
     // Останавливает event loop. После этого initialize() можно вызвать снова.

@@ -18,6 +18,7 @@
 
 #include "api/device_impl.h"
 #include "api/events.h"
+#include "api/operation_impl.h"
 
 namespace libadb {
 namespace {
@@ -104,16 +105,37 @@ SyncProgressObserver make_observer(internal::OperationContext& op, const std::st
         if (progress) progress(serial, done, reported_total);
     };
     observer.on_wire_bytes = [&counters](uint64_t bytes) { counters.on_wire += bytes; };
-    if (deadline) {
-        observer.should_abort = [deadline] {
-            if (deadline->reason != Status::Ok) return true;  // уже решили прерваться
-            const Status reason = deadline->expired();
-            if (reason == Status::Ok) return false;
-            deadline->reason = reason;
+    observer.should_abort = [deadline, &op] {
+        if (deadline && deadline->reason != Status::Ok) return true;  // уже решили прерваться
+        // Отмена (Client::cancel / Operation::cancel / close_all) — §9.
+        if (op.canceled()) {
+            if (deadline) deadline->reason = op.cancel_status();
             return true;
-        };
-    }
+        }
+        if (!deadline) return false;
+        const Status reason = deadline->expired();
+        if (reason == Status::Ok) return false;
+        deadline->reason = reason;
+        return true;
+    };
     return observer;
+}
+
+// Ошибку прерывания (таймаут или отмена) раскладываем в Result одинаково для
+// push и pull: причина уже в deadline.reason, здесь только текст.
+std::string abort_message(Status reason, const char* what) {
+    switch (reason) {
+        case Status::StallTimeout:
+            return std::string(what) + " stalled: no progress within the stall timeout";
+        case Status::CommandTimeout:
+            return std::string(what) + " exceeded the total transfer timeout";
+        case Status::ConnectionClosed:
+            return std::string(what) + " aborted: connections were closed";
+        case Status::Canceled:
+            return std::string(what) + " canceled";
+        default:
+            return std::string(what) + " aborted";
+    }
 }
 
 // Наблюдение за install (§6.2). Установка выполняется одним блокирующим вызовом
@@ -184,6 +206,17 @@ void monitor_install(Device::Impl& impl, internal::OperationContext& op, Install
     while (!done.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(ms{100});
         if (done.load(std::memory_order_acquire)) return;
+
+        // Отмена (§9). На фазе Commit это уже не отменит установку на самом
+        // устройстве — pm получил команду; мы лишь перестаём её ждать, и это
+        // отражается в Result::error.
+        if (op.canceled()) {
+            give_up(op.cancel_status(),
+                    monitor.phase == Phase::Commit
+                            ? "install canceled while committing: the device keeps installing"
+                            : "install canceled");
+            return;
+        }
 
         const int64_t now = monitor.now_ms();
         const bool transferring = monitor.transfer_started.load(std::memory_order_relaxed);
@@ -457,6 +490,10 @@ void Device::Impl::close() {
     if (!closed) {
         closed = true;
 
+        // Операции этого устройства должны узнать причину: соединение закрыли,
+        // это не IoError и не их собственная отмена (§9).
+        internal::OperationRegistry::instance().close(serial);
+
         // Порядок важен: сначала отпускаем свой shared_ptr на AdbDevice, потом
         // просим менеджер убрать транспорт — иначе устройство осталось бы живым
         // и следующий connect получил бы старое соединение.
@@ -566,13 +603,15 @@ Result Device::push(const std::string& local, const std::string& remote,
         // мог съесть последнее «100 %».
         op.progress(bytes, bytes, true);
         if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
-    } else if (deadline.reason != Status::Ok) {
-        // Передачу прервали мы сами по таймауту — не выдаём это за IoError.
+    } else if (deadline.reason != Status::Ok || op.canceled()) {
+        // Передачу прервали мы сами (таймаут или отмена) — не выдаём это за
+        // IoError. Проверяем и op.canceled(): при close_all() запись в сокет
+        // падает раньше, чем наблюдатель успевает заметить флаг, и причина
+        // ConnectionClosed иначе подменилась бы ошибкой ввода-вывода.
+        const Status reason = deadline.reason != Status::Ok ? deadline.reason : op.cancel_status();
         fill_transfer_stats(result, counters.payload, counters.on_wire, transfer_duration);
-        result.status = deadline.reason;
-        result.error = deadline.reason == Status::StallTimeout
-                               ? "push stalled: no progress within the stall timeout"
-                               : "push exceeded the total transfer timeout";
+        result.status = reason;
+        result.error = abort_message(reason, "push");
         impl_->listener->take_error();  // сообщение sync об обрыве нам не нужно
     } else {
         result.status = Status::IoError;
@@ -625,12 +664,12 @@ Result Device::pull(const std::string& remote, const std::string& local,
         fill_transfer_stats(result, bytes, counters.on_wire, transfer_duration);
         op.progress(bytes, bytes, true);
         if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
-    } else if (deadline.reason != Status::Ok) {
+    } else if (deadline.reason != Status::Ok || op.canceled()) {
+        // См. комментарий в push: op.canceled() нужен для close_all().
+        const Status reason = deadline.reason != Status::Ok ? deadline.reason : op.cancel_status();
         fill_transfer_stats(result, counters.payload, counters.on_wire, transfer_duration);
-        result.status = deadline.reason;
-        result.error = deadline.reason == Status::StallTimeout
-                               ? "pull stalled: no progress within the stall timeout"
-                               : "pull exceeded the total transfer timeout";
+        result.status = reason;
+        result.error = abort_message(reason, "pull");
         impl_->listener->take_error();
     } else {
         result.status = Status::IoError;
@@ -661,13 +700,50 @@ Result Device::Impl::run_shell(const std::string& command, const ShellOptions& o
         return result;
     }
 
-    // waitFor() сам прерывает сессию по истечении таймаута, иначе reader-поток
-    // висел бы на adb_read() до конца жизни процесса (§14 п.4).
-    const unsigned wait_ms =
-        timeout > ms::zero() ? static_cast<unsigned>(timeout.count()) : 0u;
+    // Ждём порциями: waitFor() сам прерывает сессию по истечении своего
+    // таймаута (§14 п.4), а между порциями мы успеваем заметить отмену.
+    // Без нарезки cancel() для shell работал бы только после таймаута.
+    constexpr ms kSlice{100};
     int exit_code = 0;
-    const bool finished = session->waitFor(wait_ms, &exit_code);
+    bool finished = false;
+    bool canceled = false;
+    const auto deadline = started + timeout;
+    for (;;) {
+        if (op && op->canceled()) {
+            canceled = true;
+            break;
+        }
+        ms slice = kSlice;
+        if (timeout > ms::zero()) {
+            const auto left = std::chrono::duration_cast<ms>(deadline - clock_type::now());
+            if (left <= ms::zero()) break;  // истёк общий таймаут команды
+            slice = std::min(kSlice, left);
+        }
+        if (session->waitFor(static_cast<unsigned>(slice.count()), &exit_code)) {
+            finished = true;
+            break;
+        }
+    }
+
+    // Прерывать сессию — забота вызывающего: waitFor() этого не делает.
+    // Без abort() reader-поток остался бы висеть на adb_read() до конца жизни
+    // процесса, а деструктор AdbSession ждал бы его join().
+    // abort() синхронно закрывает и наш конец socketpair, и asocket внутри
+    // fdevent-потока (см. AdbSession::abort), поэтому следующая команда на этом
+    // устройстве создаётся уже на чистом состоянии.
+    if (!finished) session->abort();
     listener->clear_output_target();
+
+    if (canceled) {
+        result.status = op->cancel_status();
+        result.phase = Phase::Transfer;
+        result.exit_code = -1;
+        result.error = result.status == Status::ConnectionClosed
+                               ? "command aborted: connections were closed"
+                               : "command canceled";
+        result.duration = elapsed_since(started);
+        return result;
+    }
 
     if (!finished) {
         result.status = Status::CommandTimeout;
@@ -895,6 +971,93 @@ Result Device::uninstall(const std::string& package, const UninstallOptions& opt
     return result;
 }
 
+
+// ---------------------------------------------------------------------------
+// Асинхронный режим (§9)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Общий каркас *_async: одна операция на устройство, работа уходит в пул.
+// task вызывается в потоке пула и возвращает Result.
+OperationPtr start_async(const DevicePtr& device, Device::Impl& impl, Command command,
+                         std::function<Result()> task) {
+    // Занятость проверяем и захватываем одним обменом: два *_async из разных
+    // потоков не должны оба «успеть».
+    bool expected = false;
+    if (!impl.async_busy.compare_exchange_strong(expected, true)) {
+        Result busy;
+        busy.status = Status::DeviceBusy;
+        busy.error = "device is busy with another asynchronous operation";
+        return internal::OperationFactory::completed(command, impl.serial, std::move(busy));
+    }
+
+    auto op_impl = std::make_unique<Operation::Impl>();
+    op_impl->command = command;
+    op_impl->serial = impl.serial;
+    // Держим устройство: вызывающий вправе отпустить свой DevicePtr сразу.
+    op_impl->device = device;
+
+    Operation::Impl* raw = op_impl.get();
+    OperationPtr operation = internal::OperationFactory::create(std::move(op_impl));
+
+    // Копия shared_ptr на саму операцию: она должна дожить до конца задачи,
+    // даже если вызывающий выбросил свой хэндл.
+    internal::AsyncPool::instance().submit([raw, operation, &impl, task = std::move(task)] {
+        // Флаг отмены передаём через поток: публичные Device::push/shell/...
+        // не принимают его параметром (не хочется тащить это в ABI).
+        Result result;
+        {
+            internal::PendingCancelFlag pending(raw->flag);
+            result = task();
+        }
+        impl.async_busy.store(false);
+        raw->complete(std::move(result));
+    });
+    return operation;
+}
+
+}  // namespace
+
+OperationPtr Device::push_async(const std::string& local, const std::string& remote,
+                                const PushOptions& options) {
+    auto self = shared_from_this();
+    return start_async(self, *impl_, Command::Push,
+                       [self, local, remote, options] { return self->push(local, remote, options); });
+}
+
+OperationPtr Device::pull_async(const std::string& remote, const std::string& local,
+                                const PullOptions& options) {
+    auto self = shared_from_this();
+    return start_async(self, *impl_, Command::Pull,
+                       [self, remote, local, options] { return self->pull(remote, local, options); });
+}
+
+OperationPtr Device::shell_async(const std::string& command, const ShellOptions& options) {
+    auto self = shared_from_this();
+    return start_async(self, *impl_, Command::Shell,
+                       [self, command, options] { return self->shell(command, options); });
+}
+
+OperationPtr Device::install_async(const std::string& apk_path, const InstallOptions& options) {
+    auto self = shared_from_this();
+    return start_async(self, *impl_, Command::Install,
+                       [self, apk_path, options] { return self->install(apk_path, options); });
+}
+
+OperationPtr Device::uninstall_async(const std::string& package, const UninstallOptions& options) {
+    auto self = shared_from_this();
+    return start_async(self, *impl_, Command::Uninstall,
+                       [self, package, options] { return self->uninstall(package, options); });
+}
+
+bool Device::busy() const {
+    return impl_->async_busy.load();
+}
+
+size_t Device::cancel_current() {
+    return internal::OperationRegistry::instance().cancel_serial(impl_->serial);
+}
 
 std::optional<std::string> Device::get_prop(const std::string& name) {
     ShellOptions options;

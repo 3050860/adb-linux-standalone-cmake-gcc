@@ -300,14 +300,115 @@ bool ProgressThrottle::allow(bool force) {
 }
 
 // ---------------------------------------------------------------------------
+// OperationRegistry
+// ---------------------------------------------------------------------------
+
+OperationRegistry& OperationRegistry::instance() {
+    // Как и остальные синглтоны библиотеки: в куче и без удаления.
+    static OperationRegistry* instance = new OperationRegistry();
+    return *instance;
+}
+
+void OperationRegistry::add(OperationId id, const std::string& serial,
+                            const CancelFlagPtr& flag) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    operations_[id] = Entry{serial, flag};
+}
+
+void OperationRegistry::remove(OperationId id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    operations_.erase(id);
+}
+
+bool OperationRegistry::cancel(OperationId id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = operations_.find(id);
+    if (it == operations_.end()) return false;
+    it->second.flag->canceled.store(true, std::memory_order_relaxed);
+    return true;
+}
+
+size_t OperationRegistry::cancel_all() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [id, entry] : operations_) {
+        entry.flag->canceled.store(true, std::memory_order_relaxed);
+    }
+    return operations_.size();
+}
+
+size_t OperationRegistry::cancel_serial(const std::string& serial) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t affected = 0;
+    for (auto& [id, entry] : operations_) {
+        if (entry.serial != serial) continue;
+        entry.flag->canceled.store(true, std::memory_order_relaxed);
+        ++affected;
+    }
+    return affected;
+}
+
+size_t OperationRegistry::close(const std::string& serial) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t affected = 0;
+    for (auto& [id, entry] : operations_) {
+        if (!serial.empty() && entry.serial != serial) continue;
+        entry.flag->connection_closed.store(true, std::memory_order_relaxed);
+        ++affected;
+    }
+    return affected;
+}
+
+size_t OperationRegistry::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return operations_.size();
+}
+
+// ---------------------------------------------------------------------------
+// PendingCancelFlag
+// ---------------------------------------------------------------------------
+
+namespace {
+thread_local CancelFlagPtr g_pending_cancel_flag;
+}  // namespace
+
+PendingCancelFlag::PendingCancelFlag(CancelFlagPtr flag)
+    : previous_(std::move(g_pending_cancel_flag)) {
+    g_pending_cancel_flag = std::move(flag);
+}
+
+PendingCancelFlag::~PendingCancelFlag() {
+    g_pending_cancel_flag = std::move(previous_);
+}
+
+CancelFlagPtr PendingCancelFlag::take() {
+    CancelFlagPtr flag = std::move(g_pending_cancel_flag);
+    g_pending_cancel_flag = nullptr;
+    return flag;
+}
+
+// ---------------------------------------------------------------------------
 // OperationContext
 // ---------------------------------------------------------------------------
 
-OperationContext::OperationContext(Command command, std::string serial)
+OperationContext::OperationContext(Command command, std::string serial, CancelFlagPtr flag)
     : id_(EventBus::next_operation_id()),
       command_(command),
       serial_(std::move(serial)),
-      started_(std::chrono::steady_clock::now()) {}
+      started_(std::chrono::steady_clock::now()),
+      flag_(flag ? std::move(flag) : PendingCancelFlag::take()) {
+    // Флага не было ни в аргументе, ни приготовленного на потоке — создаём свой
+    // (обычный синхронный вызов из кода приложения).
+    if (!flag_) flag_ = std::make_shared<CancelFlag>();
+    // Публикуем id в флаге: только так внешний хэндл Operation узнаёт его.
+    flag_->operation_id.store(id_, std::memory_order_relaxed);
+    // Регистрируемся сразу в конструкторе: cancel(id) должен работать с того
+    // момента, как вызывающий получил id через on_start.
+    OperationRegistry::instance().add(id_, serial_, flag_);
+}
+
+OperationContext::~OperationContext() {
+    OperationRegistry::instance().remove(id_);
+}
 
 ms OperationContext::elapsed() const {
     return std::chrono::duration_cast<ms>(std::chrono::steady_clock::now() - started_);

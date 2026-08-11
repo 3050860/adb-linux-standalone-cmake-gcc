@@ -35,11 +35,11 @@ bool AdbSession::waitFor(unsigned timeout_ms, int* exit_code) {
 
     // Ждём именно future, а не сам поток: reader-поток закрывается сам, а нам
     // важно, чтобы код возврата был уже выставлен.
+    // abort() здесь НЕ вызывается: метод рассчитан и на ожидание порциями
+    // (вызывающий проверяет отмену между ними), а прерванную сессию продолжать
+    // уже нельзя. Решение «рвать или ждать дальше» — за вызывающим.
     if (exit_code_future_.wait_for(std::chrono::milliseconds(timeout_ms)) !=
         std::future_status::ready) {
-        // Таймаут: рвём сессию, чтобы reader-поток вышел и не остался висеть
-        // на adb_read() до конца жизни процесса.
-        abort();
         return false;
     }
 
@@ -107,11 +107,34 @@ bool AdbSession::start(bool start_reader_thread) {
 
 void AdbSession::abort() {
     if (is_aborted_.exchange(true)) return;
-    
-    // Закрытие local_fd_ приведет к тому, что readerThread завершится.
-    // ADB заметит это (через local_socket_event_func), сам отправит A_CLSE 
-    // и корректно уничтожит asocket.
-    local_fd_.reset(); 
+
+    // Порядок важен (этап 8).
+    //
+    // Раньше здесь стоял просто local_fd_.reset(). Этого мало: adb-конец
+    // socketpair зарегистрирован в epoll, и закрытие НАШЕГО конца даёт
+    // fdevent-циклу событие только в момент следующей активности. До тех пор
+    // asocket жив, а поток на устройстве не закрыт. На практике это выглядело
+    // так: команда, отправленная сразу после прерванной, немедленно получала
+    // EOF, потому что fdevent-цикл закрывал старый local socket уже после того,
+    // как новая сессия переиспользовала тот же номер дескриптора.
+    //
+    // Поэтому сначала делаем shutdown() — дескриптор остаётся в epoll и цикл
+    // гарантированно видит EOF, сам отправляет A_CLSE и уничтожает asocket
+    // (трогать asocket из нашего потока нельзя: он принадлежит fdevent-циклу и
+    // удаляет себя сам).
+    if (local_fd_.get() >= 0) {
+        adb_shutdown(local_fd_.get(), SHUT_RDWR);
+    }
+
+    // Ждём, пока fdevent-цикл разберёт закрытие: пустая задача на его очереди
+    // выполнится строго после уже накопленных событий.
+    std::promise<void> drained;
+    std::future<void> drained_future = drained.get_future();
+    fdevent_run_on_looper([&drained]() { drained.set_value(); });
+    drained_future.wait();
+
+    // Только теперь закрываем свой конец: readerThread выйдет из adb_read().
+    local_fd_.reset();
 }
 bool AdbSession::write2(const void* data, size_t length) {
     return adb_write(local_fd_.get(), data, length) == static_cast<ssize_t>(length);

@@ -10,6 +10,7 @@
 #include "AdbManager.h"
 #include "api/device_impl.h"
 #include "api/events.h"
+#include "api/operation_impl.h"
 
 namespace libadb {
 namespace {
@@ -171,6 +172,7 @@ Client& Client::instance() {
 
 Status Client::initialize(const Options& options) {
     internal::ensure_logging_initialized();
+    internal::ensure_sigpipe_ignored();
 
     {
         std::unique_lock<std::shared_mutex> lock(impl_->mutex);
@@ -186,6 +188,9 @@ Status Client::initialize(const Options& options) {
     bus.set_queue_limit(options.event_queue_limit);
     bus.set_progress_interval(options.progress_interval);
     bus.set_primary_subscription(options.on_event, options.event_mask);
+
+    // Пул асинхронных операций (§9): отдельный от батч-режима.
+    internal::AsyncPool::instance().configure(options.async_worker_threads);
 
     auto& manager = AdbManager::instance();
     manager.setMaxThreads(options.max_parallel);
@@ -405,6 +410,95 @@ std::map<std::string, Result> Client::uninstall_all(const std::vector<std::strin
                    [&](Device& device) { return device.uninstall(package, options); });
 }
 
+// Общий каркас *_all_async: на каждый адрес — своя операция в пуле.
+// Подключение выполняется внутри задачи, поэтому лимит слотов (§7) продолжает
+// работать: лишние воркеры просто ждут слот.
+namespace {
+
+BatchOperationPtr run_all_async(const std::vector<std::string>& addresses,
+                                Command command,
+                                std::function<Result(Device&)> operation) {
+    auto batch = std::make_unique<BatchOperation::Impl>();
+    batch->addresses = addresses;
+
+    for (const auto& address : addresses) {
+        auto op_impl = std::make_unique<Operation::Impl>();
+        op_impl->command = command;
+        op_impl->serial = address;
+        Operation::Impl* raw = op_impl.get();
+        OperationPtr op = internal::OperationFactory::create(std::move(op_impl));
+        batch->operations.push_back(op);
+
+        internal::AsyncPool::instance().submit([raw, op, address, operation] {
+            internal::PendingCancelFlag pending(raw->flag);
+
+            Status status = Status::Ok;
+            DevicePtr device = Client::instance().connect(address, &status);
+            Result result;
+            if (!device) {
+                result = make_error_result(status, std::string("connect failed: ") +
+                                                           to_string(status));
+            } else {
+                result = operation(*device);
+                // Закрываем сразу: иначе слот подключения оставался бы занятым
+                // до тех пор, пока вызывающий не отпустит BatchOperation.
+                device->close();
+            }
+            raw->complete(std::move(result));
+        });
+    }
+
+    return internal::OperationFactory::create_batch(std::move(batch));
+}
+
+}  // namespace
+
+BatchOperationPtr Client::push_all_async(const std::vector<std::string>& addresses,
+                                         const std::string& local, const std::string& remote,
+                                         const PushOptions& options) {
+    return run_all_async(addresses, Command::Push, [local, remote, options](Device& device) {
+        return device.push(local, remote, options);
+    });
+}
+
+BatchOperationPtr Client::pull_all_async(const std::vector<std::string>& addresses,
+                                         const std::string& remote, const std::string& local_dir,
+                                         const PullOptions& options) {
+    return run_all_async(addresses, Command::Pull, [remote, local_dir, options](Device& device) {
+        // Как и в синхронном pull_all: раскладываем по <local_dir>/<serial>/,
+        // чтобы файлы с разных устройств не затирали друг друга.
+        std::string target = local_dir;
+        if (!target.empty() && target.back() != '/') target += '/';
+        target += device.serial();
+        target += '/';
+        return device.pull(remote, target, options);
+    });
+}
+
+BatchOperationPtr Client::shell_all_async(const std::vector<std::string>& addresses,
+                                          const std::string& command,
+                                          const ShellOptions& options) {
+    return run_all_async(addresses, Command::Shell, [command, options](Device& device) {
+        return device.shell(command, options);
+    });
+}
+
+BatchOperationPtr Client::install_all_async(const std::vector<std::string>& addresses,
+                                            const std::string& apk_path,
+                                            const InstallOptions& options) {
+    return run_all_async(addresses, Command::Install, [apk_path, options](Device& device) {
+        return device.install(apk_path, options);
+    });
+}
+
+BatchOperationPtr Client::uninstall_all_async(const std::vector<std::string>& addresses,
+                                              const std::string& package,
+                                              const UninstallOptions& options) {
+    return run_all_async(addresses, Command::Uninstall, [package, options](Device& device) {
+        return device.uninstall(package, options);
+    });
+}
+
 void Client::set_max_connections(size_t limit) {
     {
         std::unique_lock<std::shared_mutex> lock(impl_->mutex);
@@ -488,7 +582,22 @@ void Client::set_log_sink(LogSink sink) {
     libadb::set_log_sink(std::move(sink));
 }
 
+bool Client::cancel(OperationId id) {
+    return internal::OperationRegistry::instance().cancel(id);
+}
+
+size_t Client::cancel_all() {
+    return internal::OperationRegistry::instance().cancel_all();
+}
+
+size_t Client::active_operations() const {
+    return internal::OperationRegistry::instance().size();
+}
+
 void Client::close_all() {
+    // Сначала помечаем операции: пока рвутся транспорты, они успеют увидеть
+    // причину ConnectionClosed, а не выдать обрыв за IoError.
+    internal::OperationRegistry::instance().close(std::string());
     impl_->close_all();
 }
 
@@ -500,6 +609,9 @@ void Client::shutdown() {
         impl_->initialized = false;
     }
     internal::emit_log(LogLevel::Debug, "", "shutting down");
+    // Пул останавливаем до остановки event loop: незавершённая асинхронная
+    // операция полезла бы в уже мёртвый adb.
+    internal::AsyncPool::instance().stop();
     internal::publish_device_event(EventType::ClientShutdown, "", Status::Ok, "client shutdown");
     // Досылаем всё, что уже в очереди, и только потом останавливаем шину:
     // подписчик должен увидеть ClientShutdown.

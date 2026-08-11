@@ -1,4 +1,8 @@
-// libadb: определения глобалов, которые в консольных клиентах задаёт main().
+// libadb: определения глобалов и разовой настройки процесса, которые в
+// консольных клиентах делает main().
+#include <csignal>
+
+#include "api/internal.h"
 //
 // adb_client.cpp использует __adb_argv/__adb_envp для перезапуска себя как
 // adb-сервера (execve). В библиотеке этот путь не используется: сервер не
@@ -19,4 +23,24 @@ const char** __adb_envp = nullptr;
 bool adb_log_default_enabled() {
     return false;
 }
+
+namespace libadb::internal {
+
+// Консольный adb делает signal(SIGPIPE, SIG_IGN) в main(): запись в оборванный
+// сокет должна давать EPIPE, а не убивать процесс. Библиотеке это нужно не
+// меньше (например, соединение закрыли через close_all() во время передачи),
+// но чужой обработчик перебивать нельзя — поэтому ставим SIG_IGN только если
+// приложение ничего не настраивало.
+void ensure_sigpipe_ignored() {
+    struct sigaction current{};
+    if (sigaction(SIGPIPE, nullptr, &current) != 0) return;
+    if (current.sa_handler != SIG_DFL) return;  // приложение уже решило само
+
+    struct sigaction ignore{};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    sigaction(SIGPIPE, &ignore, nullptr);
+}
+
+}  // namespace libadb::internal
 

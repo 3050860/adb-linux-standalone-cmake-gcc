@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -109,6 +110,10 @@ struct LIBADB_INTERNAL Device::Impl {
     // возвращается Status::CommandTimeout.
     Result run_shell(const std::string& command, const ShellOptions& options,
                      internal::OperationContext* op, ms timeout);
+
+    // Занято ли устройство асинхронной операцией. Синхронные вызовы этот флаг
+    // не выставляют: их последовательность — забота вызывающего.
+    std::atomic<bool> async_busy{false};
 };
 
 namespace internal {

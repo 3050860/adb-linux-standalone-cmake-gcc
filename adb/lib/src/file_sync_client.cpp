@@ -645,7 +645,7 @@ class SyncConnection {
         req_done->path_length = mtime;
         p += sizeof(SyncRequest);
 
-        WriteOrDie(lpath, rpath, &buf[0], (p - &buf[0]));
+        if (!WriteOrDie(lpath, rpath, &buf[0], (p - &buf[0]))) return false;
 
         RecordFileSent(lpath, rpath);
         RecordBytesTransferred(data_length);
@@ -748,7 +748,11 @@ class SyncConnection {
                 if (!output.empty()) {
                     sbuf.size = output.size();
                     memcpy(sbuf.data, output.data(), output.size());
-                    WriteOrDie(lpath, rpath, &sbuf, sizeof(SyncRequest) + output.size());
+                    // Возврат проверяем: раньше WriteOrDie() всегда убивал
+                    // процесс, а в библиотеке он просто отдаёт false.
+                    if (!WriteOrDie(lpath, rpath, &sbuf, sizeof(SyncRequest) + output.size())) {
+                        return false;
+                    }
                 }
 
                 if (result == EncodeResult::Done) {
@@ -808,7 +812,7 @@ class SyncConnection {
             }
 
             sbuf.size = bytes_read;
-            WriteOrDie(lpath, rpath, &sbuf, sizeof(SyncRequest) + bytes_read);
+            if (!WriteOrDie(lpath, rpath, &sbuf, sizeof(SyncRequest) + bytes_read)) return false;
 
             RecordBytesTransferred(bytes_read);
             bytes_copied += bytes_read;
@@ -1030,10 +1034,16 @@ class SyncConnection {
                 } else {
                     ReportCopyFailure(from, to, msg);
                 }
-            } else {
+            } else if (!g_sync_observer) {
                 Error("%zu-byte write failed: %s", data_length, strerror(errno));
             }
-            _exit(1);
+            // В консольном adb здесь стоял _exit(1): процесс всё равно умирал.
+            // Библиотека убивать процесс приложения не имеет права (например,
+            // соединение закрыли через close_all() прямо во время передачи),
+            // поэтому при активном наблюдателе просто возвращаем ошибку —
+            // вызывающий получит её в Result.
+            if (!g_sync_observer) _exit(1);
+            return false;
         }
         // Единственная точка записи в сокет при push — здесь и считаем, сколько
         // реально ушло в сеть (после сжатия).
