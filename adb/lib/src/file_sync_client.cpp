@@ -68,6 +68,10 @@ static bool sync_should_abort() {
     return g_sync_observer && g_sync_observer->should_abort && g_sync_observer->should_abort();
 }
 
+// Прерывание случается только по просьбе наблюдателя, поэтому Error() в этих
+// местах не вызывается: причину (таймаут/отмену) вызывающий уже знает, а
+// SyncConnection::Error() печатает в stderr приложения — библиотеке так нельзя.
+
 struct syncsendbuf {
     unsigned id;
     unsigned size;
@@ -714,10 +718,7 @@ class SyncConnection {
         while (sending) {
             // Отмена/таймаут проверяются между блоками: гранулярность —
             // один блок SYNC_DATA_MAX (64 КиБ).
-            if (sync_should_abort()) {
-                Error("transfer of '%s' aborted", lpath.c_str());
-                return false;
-            }
+            if (sync_should_abort()) return false;
 
             Block input(SYNC_DATA_MAX);
             int r = adb_read(lfd.get(), input.data(), input.size());
@@ -796,10 +797,7 @@ class SyncConnection {
         sbuf.id = ID_DATA;
 
         while (true) {
-            if (sync_should_abort()) {
-                Error("transfer of '%s' aborted", lpath.c_str());
-                return false;
-            }
+            if (sync_should_abort()) return false;
 
             int bytes_read = adb_read(lfd, sbuf.data, max);
             if (bytes_read == -1) {
@@ -1159,7 +1157,6 @@ static bool sync_recv_v1(SyncConnection& sc, const char* rpath, const char* lpat
     uint64_t bytes_copied = 0;
     while (true) {
         if (sync_should_abort()) {
-            sc.Error("transfer of '%s' aborted", rpath);
             adb_unlink(lpath);
             return false;
         }
@@ -1255,7 +1252,6 @@ static bool sync_recv_v2(SyncConnection& sc, const char* rpath, const char* lpat
 
     while (true) {
         if (sync_should_abort()) {
-            sc.Error("transfer of '%s' aborted", rpath);
             adb_unlink(lpath);
             return false;
         }

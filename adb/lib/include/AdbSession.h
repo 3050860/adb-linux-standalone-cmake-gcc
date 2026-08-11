@@ -22,6 +22,12 @@ public:
     void abort();
     bool write2(const void* data, size_t length);
     int wait();
+
+    // Ждёт завершения не дольше timeout_ms. Возвращает true, если сессия
+    // завершилась (код возврата — в *exit_code); false — истёк таймаут,
+    // сессия при этом уже прервана через abort() (§14 п.4).
+    // timeout_ms == 0 — ждать бесконечно, как wait().
+    bool waitFor(unsigned timeout_ms, int* exit_code);
     int getFd() const { return local_fd_.get(); }
 private:
     void readerThread();

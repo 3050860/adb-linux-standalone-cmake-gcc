@@ -105,8 +105,10 @@ struct LIBADB_INTERNAL Device::Impl {
     // Выполняет shell-команду. op != nullptr — события публикуются от имени
     // уже начатой операции (например, uninstall, который работает через shell
     // и не должен создавать вторую операцию).
+    // timeout: 0 — ждать бесконечно; по истечении сессия прерывается и
+    // возвращается Status::CommandTimeout.
     Result run_shell(const std::string& command, const ShellOptions& options,
-                     internal::OperationContext* op);
+                     internal::OperationContext* op, ms timeout);
 };
 
 namespace internal {

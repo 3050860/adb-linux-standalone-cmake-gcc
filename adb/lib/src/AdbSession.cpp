@@ -26,6 +26,28 @@ int AdbSession::wait() {
     return exit_code_future_.get();
 }
 
+bool AdbSession::waitFor(unsigned timeout_ms, int* exit_code) {
+    if (timeout_ms == 0) {
+        const int code = wait();
+        if (exit_code) *exit_code = code;
+        return true;
+    }
+
+    // Ждём именно future, а не сам поток: reader-поток закрывается сам, а нам
+    // важно, чтобы код возврата был уже выставлен.
+    if (exit_code_future_.wait_for(std::chrono::milliseconds(timeout_ms)) !=
+        std::future_status::ready) {
+        // Таймаут: рвём сессию, чтобы reader-поток вышел и не остался висеть
+        // на adb_read() до конца жизни процесса.
+        abort();
+        return false;
+    }
+
+    const int code = exit_code_future_.get();
+    if (exit_code) *exit_code = code;
+    return true;
+}
+
 bool AdbSession::start(bool start_reader_thread) {
     atransport* t = device_->getTransport();
     if (!t) {

@@ -20,7 +20,7 @@ int main() {
     printf("before init: initialized=%d\n", (int)client.initialized());
 
     libadb::Options options;
-    options.connect_timeout = libadb::ms{8000};
+    options.timeouts.connect = libadb::ms{8000};
     options.max_parallel = 1;  // строго по одному устройству за раз
     libadb::Status s = client.initialize(options);
     printf("initialize=%s then initialized=%d, default_port=%u, max_parallel=%zu\n",

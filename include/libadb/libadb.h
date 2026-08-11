@@ -293,26 +293,84 @@ constexpr EventMask event_bit(EventType type) {
 }
 
 // ---------------------------------------------------------------------------
+// Таймауты (§6)
+// ---------------------------------------------------------------------------
+
+// Передача данных: общий дедлайн и/или отсутствие прогресса.
+// Срабатывает тот, который наступит раньше; оба нулевые — без таймаута.
+// По умолчанию активен только stall: абсолютное время передачи на одни и те же
+// устройства плавает в разы из-за топологии сети, поэтому жёсткий total даёт
+// ложные срывы, а stall ловит именно «канал умер».
+struct TransferTimeout {
+    ms total{0};       // дедлайн на всю передачу; 0 = не ограничивать
+    ms stall{30000};   // нет прогресса дольше этого; 0 = не ограничивать
+};
+
+// Как проверять, что устройство живо, пока ждём ответа на install-commit.
+enum class HealthCheckMode {
+    None = 0,   // не проверять
+    Transport,  // (дефолт) дешёвая проверка живости соединения/adbd
+    Shell,      // короткая служебная shell-команда — строже, но лишний процесс
+};
+
+LIBADB_API const char* to_string(HealthCheckMode);
+
+// Установка неоднородна по наблюдаемости, поэтому таймаут у каждой фазы свой.
+struct InstallTimeout {
+    ms prepare{60000};          // распаковка .apks, чтение локальных файлов
+    ms create_session{30000};   // pm install-create
+    TransferTimeout transfer;   // pm install-write: байты идут на устройство
+
+    // Ожидание ответа pm после коммита: прогресса нет, только общий дедлайн.
+    // Значение щедрое — dexopt большого приложения на слабом устройстве это минуты.
+    ms commit{15 * 60000};
+
+    // Пока ждём commit, проверяем, что устройство живо. На каждую успешную
+    // проверку летит событие OperationHeartbeat.
+    HealthCheckMode commit_healthcheck = HealthCheckMode::Transport;
+    ms commit_healthcheck_interval{10000};  // 0 = не проверять
+    int commit_healthcheck_failures = 3;    // сколько подряд считать потерей устройства
+};
+
+struct Timeouts {
+    ms connect{15000};       // до состояния "device", включая авторизацию
+    ms slot_acquire{30000};  // ожидание свободного слота подключения (§7);
+                             // 0 = не ждать вовсе, ms::max() = ждать бесконечно
+    ms shell{60000};         // обычная shell-команда
+    TransferTimeout push;
+    TransferTimeout pull;
+    InstallTimeout install;
+    ms uninstall{120000};
+    ms close{5000};          // грациозное закрытие соединения
+};
+
+// ---------------------------------------------------------------------------
 // Опции отдельных операций
 // ---------------------------------------------------------------------------
+
+// У каждой операции таймаут можно переопределить точечно: std::nullopt —
+// взять из Client::timeouts().
 
 struct PushOptions {
     Compression compression = Compression::Any;
     bool sync_only_newer = false;  // как `adb push --sync`: пропускать совпадающие файлы
     ProgressFn on_progress;
     StartedFn on_start;            // получить OperationId до начала работы
+    std::optional<TransferTimeout> timeout;
 };
 
 struct PullOptions {
     Compression compression = Compression::None;
     ProgressFn on_progress;
     StartedFn on_start;
+    std::optional<TransferTimeout> timeout;
 };
 
 struct ShellOptions {
     bool capture_output = true;  // складывать вывод в Result::output
     OutputFn on_output;          // и/или отдавать его потоком
     StartedFn on_start;
+    std::optional<ms> timeout;   // 0 = ждать бесконечно
 };
 
 struct InstallOptions {
@@ -323,11 +381,13 @@ struct InstallOptions {
     ProgressFn on_progress;            // прогресс заливки apk
     OutputFn on_output;                // сырой вывод pm
     StartedFn on_start;
+    std::optional<InstallTimeout> timeout;
 };
 
 struct UninstallOptions {
     bool keep_data = false;  // -k
     StartedFn on_start;
+    std::optional<ms> timeout;
 };
 
 // ---------------------------------------------------------------------------
@@ -336,9 +396,12 @@ struct UninstallOptions {
 
 struct Options {
     uint16_t default_port = 5555;   // подставляется, если в адресе нет порта
-    ms connect_timeout{15000};      // ожидание перехода устройства в состояние device
     LogOptions log;                 // канал 1
     LogSink log_sink;               // канал 2
+
+    // Все таймауты одним местом (§6). До этапа 7 connect_timeout и slot_acquire
+    // жили прямо в Options; теперь это timeouts.connect и timeouts.slot_acquire.
+    Timeouts timeouts;
 
     // Ограничение параллелизма для групповых операций Client::for_each и *_all.
     // 0 — без ограничения (поток на устройство).
@@ -348,11 +411,6 @@ struct Options {
     // батч-режима и ручных connect(): библиотека никогда не держит открытыми
     // больше max_connections устройств. 0 — без ограничения.
     size_t max_connections = 0;
-
-    // Сколько connect() ждёт освобождения слота, если лимит исчерпан:
-    // 0 — не ждать вовсе (сразу Status::SlotBusy),
-    // ms::max() — ждать бесконечно, иначе — Status::SlotTimeout по истечении.
-    ms slot_acquire{30000};
 
     // --- события (§8) ---
 
@@ -486,6 +544,11 @@ class LIBADB_API Client {
 
     // Сколько слотов занято прямо сейчас (открытые подключения).
     size_t active_connections() const;
+
+    // Таймауты в рантайме (§6). Действуют на операции, начатые после вызова;
+    // уже идущие продолжают жить со своими значениями.
+    void set_timeouts(const Timeouts& timeouts);
+    Timeouts timeouts() const;
 
     // --- события (§8) ---
 

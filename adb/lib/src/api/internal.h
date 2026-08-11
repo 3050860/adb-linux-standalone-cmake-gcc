@@ -26,5 +26,9 @@ LIBADB_INTERNAL void emit_log(LogLevel level, const std::string& serial,
 // Есть ли смысл форматировать сообщение (sink задан и уровень проходит фильтр).
 LIBADB_INTERNAL bool log_sink_wants(LogLevel level);
 
+// Текущие таймауты клиента (§6). Операции читают их на старте, поэтому
+// Client::set_timeouts() влияет на всё, что начнётся после вызова.
+LIBADB_INTERNAL Timeouts current_timeouts();
+
 
 }  // namespace libadb::internal

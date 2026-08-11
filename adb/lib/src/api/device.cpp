@@ -1,7 +1,9 @@
 // libadb: реализация Device — операции на одном устройстве.
 #include <sys/stat.h>
 
+#include <atomic>
 #include <chrono>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -51,22 +53,197 @@ struct TransferCounters {
     uint64_t expected = 0;  // ожидаемый размер, если известен
 };
 
+// Дедлайны передачи (§6.1): общий и «нет прогресса дольше stall».
+// Живёт в стеке операции; читается из потока передачи, обновляется оттуда же.
+class TransferDeadline {
+  public:
+    TransferDeadline(TransferTimeout timeout, clock_type::time_point start)
+        : timeout_(timeout), start_(start), last_progress_(start) {}
+
+    // Вызывать при каждом продвижении: сбрасывает отсчёт stall.
+    void touch() { last_progress_ = clock_type::now(); }
+
+    // Какой таймаут сработал (Status::Ok — ни один).
+    Status expired() const {
+        const auto now = clock_type::now();
+        if (timeout_.total > ms::zero() && now - start_ >= timeout_.total) {
+            return Status::CommandTimeout;
+        }
+        if (timeout_.stall > ms::zero() && now - last_progress_ >= timeout_.stall) {
+            return Status::StallTimeout;
+        }
+        return Status::Ok;
+    }
+
+    // Запомненная причина срыва: должна дожить до формирования Result, а сам
+    // expired() к тому моменту уже неинформативен (мы прервали передачу).
+    Status reason = Status::Ok;
+
+  private:
+    TransferTimeout timeout_;
+    clock_type::time_point start_;
+    clock_type::time_point last_progress_;
+};
+
 // Собирает наблюдателя, который кормит события операции и колбэк вызывающего.
-// serial и progress живут не меньше самого наблюдателя (стек операции).
+// Все ссылки живут в стеке операции, то есть дольше самого наблюдателя.
+// deadline может быть nullptr — тогда передача не ограничена по времени.
 SyncProgressObserver make_observer(internal::OperationContext& op, const std::string& serial,
-                                  const ProgressFn& progress, TransferCounters& counters) {
+                                  const ProgressFn& progress, TransferCounters& counters,
+                                  TransferDeadline* deadline) {
     SyncProgressObserver observer;
-    observer.on_progress = [&op, &serial, &progress, &counters](const std::string& /*path*/,
-                                                               uint64_t done, uint64_t total) {
+    observer.on_progress = [&op, &serial, &progress, &counters, deadline](
+                                   const std::string& /*path*/, uint64_t done, uint64_t total) {
         // done приходит от sync накопительно по текущему файлу; total может быть
         // нулём (размер неизвестен) — тогда подставляем то, что знаем сами.
         counters.payload = done;
         const uint64_t reported_total = total != 0 ? total : counters.expected;
+        // Прогресс есть — stall-таймер начинает отсчёт заново.
+        if (deadline) deadline->touch();
         op.progress(done, reported_total);
         if (progress) progress(serial, done, reported_total);
     };
     observer.on_wire_bytes = [&counters](uint64_t bytes) { counters.on_wire += bytes; };
+    if (deadline) {
+        observer.should_abort = [deadline] {
+            if (deadline->reason != Status::Ok) return true;  // уже решили прерваться
+            const Status reason = deadline->expired();
+            if (reason == Status::Ok) return false;
+            deadline->reason = reason;
+            return true;
+        };
+    }
     return observer;
+}
+
+// Наблюдение за install (§6.2). Установка выполняется одним блокирующим вызовом
+// install_multiple_app(), поэтому фазы отслеживаются по наблюдаемым признакам:
+// пошли байты → Transfer; байты кончились → Commit (pm верифицирует и ставит).
+// Дедлайны у фаз разные, а на фазе Commit прогресса нет вообще — там вместо
+// угадывания времени работает health-check.
+struct InstallMonitor {
+    InstallTimeout timeout;
+    clock_type::time_point started;
+
+    // Обновляется наблюдателем передачи.
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<int64_t> last_progress_ms{0};   // от started
+    std::atomic<bool> transfer_started{false};
+
+    // Итог наблюдения: пишется только потоком-наблюдателем и читается после
+    // его завершения, поэтому синхронизация не нужна.
+    std::atomic<bool> abort{false};
+    Status reason = Status::Ok;
+    std::string message;
+    Phase phase = Phase::CreateSession;  // на какой фазе прервались
+
+    int64_t now_ms() const {
+        return std::chrono::duration_cast<ms>(clock_type::now() - started).count();
+    }
+};
+
+// Одна проверка «устройство ещё живо». Дешёвый режим Transport ничего не
+// запускает на устройстве; Shell строже, но создаёт процесс на каждую проверку.
+bool health_check_ok(Device::Impl& impl, HealthCheckMode mode) {
+    switch (mode) {
+        case HealthCheckMode::None:
+            return true;
+        case HealthCheckMode::Transport:
+            return impl.device && impl.device->getTransport() != nullptr &&
+                   impl.listener->online();
+        case HealthCheckMode::Shell: {
+            if (!impl.device || impl.device->getTransport() == nullptr) return false;
+            ShellOptions probe;
+            probe.capture_output = false;
+            // Своя короткая команда со своим таймаутом: она не должна ждать
+            // столько же, сколько сам commit.
+            Result result = impl.run_shell("true", probe, nullptr, ms{10000});
+            return result.ok();
+        }
+    }
+    return true;
+}
+
+// Следит за фазами install и их таймаутами, пока рабочий поток занят
+// install_multiple_app(). Возвращается, когда установка закончилась сама или
+// когда мы решили её прервать (monitor.abort — наблюдатель прочитает его между
+// блоками данных).
+void monitor_install(Device::Impl& impl, internal::OperationContext& op, InstallMonitor& monitor,
+                     const std::atomic<bool>& done) {
+    const InstallTimeout& timeout = monitor.timeout;
+    int health_failures = 0;
+    int64_t commit_started_ms = -1;
+    int64_t last_health_ms = 0;
+
+    const auto give_up = [&monitor](Status reason, std::string message) {
+        monitor.reason = reason;
+        monitor.message = std::move(message);
+        monitor.abort.store(true, std::memory_order_relaxed);
+    };
+
+    while (!done.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(ms{100});
+        if (done.load(std::memory_order_acquire)) return;
+
+        const int64_t now = monitor.now_ms();
+        const bool transferring = monitor.transfer_started.load(std::memory_order_relaxed);
+        const int64_t last_progress = monitor.last_progress_ms.load(std::memory_order_relaxed);
+
+        if (!transferring) {
+            // Байты ещё не пошли — идёт pm install-create.
+            if (timeout.create_session > ms::zero() && now >= timeout.create_session.count()) {
+                give_up(Status::CommandTimeout, "pm install-create did not respond in time");
+                return;
+            }
+            continue;
+        }
+
+        // Тишина дольше секунды после заливки означает, что pm уже коммитит:
+        // отдельного сигнала «install-write закончился» у нас нет.
+        const bool committing = monitor.phase == Phase::Commit || now - last_progress >= 1000;
+        if (!committing) {
+            if (monitor.phase != Phase::Transfer) {
+                monitor.phase = Phase::Transfer;
+                op.set_phase(Phase::Transfer);
+            }
+            const TransferTimeout& tt = timeout.transfer;
+            if (tt.total > ms::zero() && now >= tt.total.count()) {
+                give_up(Status::CommandTimeout, "install transfer exceeded the total timeout");
+                return;
+            }
+            if (tt.stall > ms::zero() && now - last_progress >= tt.stall.count()) {
+                give_up(Status::StallTimeout, "install transfer stalled");
+                return;
+            }
+            continue;
+        }
+
+        // Фаза Commit: прогресса нет принципиально, поэтому общий дедлайн плюс
+        // health-check — отличаем «долго ставится» от «устройство умерло».
+        if (monitor.phase != Phase::Commit) {
+            monitor.phase = Phase::Commit;
+            commit_started_ms = now;
+            last_health_ms = now;
+            op.set_phase(Phase::Commit);
+        }
+        if (timeout.commit > ms::zero() && now - commit_started_ms >= timeout.commit.count()) {
+            give_up(Status::CommandTimeout, "pm install-commit did not finish in time");
+            return;
+        }
+
+        const ms interval = timeout.commit_healthcheck_interval;
+        if (timeout.commit_healthcheck == HealthCheckMode::None || interval <= ms::zero()) continue;
+        if (now - last_health_ms < interval.count()) continue;
+
+        last_health_ms = now;
+        if (health_check_ok(impl, timeout.commit_healthcheck)) {
+            health_failures = 0;
+            op.heartbeat("device is alive, still committing");
+        } else if (++health_failures >= timeout.commit_healthcheck_failures) {
+            give_up(Status::DeviceLost, "device stopped responding while committing");
+            return;
+        }
+    }
 }
 
 // Оборачивает аргумент в одинарные кавычки для shell на устройстве.
@@ -362,10 +539,12 @@ Result Device::push(const std::string& local, const std::string& remote,
 
     TransferCounters counters;
     counters.expected = size;
-    const SyncProgressObserver observer =
-        make_observer(op, impl_->serial, options.on_progress, counters);
-
     const auto transfer_started = clock_type::now();
+    TransferDeadline deadline(options.timeout.value_or(internal::current_timeouts().push),
+                              transfer_started);
+    const SyncProgressObserver observer =
+        make_observer(op, impl_->serial, options.on_progress, counters, &deadline);
+
     // quiet = true: прогресс-бар SyncConnection пишет в stdout и ломал бы вывод
     // приложения, у которого много устройств одновременно. Прогресс идёт
     // наблюдателем — в события и в options.on_progress.
@@ -387,6 +566,14 @@ Result Device::push(const std::string& local, const std::string& remote,
         // мог съесть последнее «100 %».
         op.progress(bytes, bytes, true);
         if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
+    } else if (deadline.reason != Status::Ok) {
+        // Передачу прервали мы сами по таймауту — не выдаём это за IoError.
+        fill_transfer_stats(result, counters.payload, counters.on_wire, transfer_duration);
+        result.status = deadline.reason;
+        result.error = deadline.reason == Status::StallTimeout
+                               ? "push stalled: no progress within the stall timeout"
+                               : "push exceeded the total transfer timeout";
+        impl_->listener->take_error();  // сообщение sync об обрыве нам не нужно
     } else {
         result.status = Status::IoError;
         result.error = impl_->listener->take_error();
@@ -416,10 +603,12 @@ Result Device::pull(const std::string& remote, const std::string& local,
     // Размер файла на устройстве заранее не известен: sync сообщит его сам в
     // первом же событии прогресса (total).
     TransferCounters counters;
-    const SyncProgressObserver observer =
-        make_observer(op, impl_->serial, options.on_progress, counters);
-
     const auto transfer_started = clock_type::now();
+    TransferDeadline deadline(options.timeout.value_or(internal::current_timeouts().pull),
+                              transfer_started);
+    const SyncProgressObserver observer =
+        make_observer(op, impl_->serial, options.on_progress, counters, &deadline);
+
     uint64_t transferred = 0;
     const bool ok = sync.pull({remote}, local, false,
                               internal::to_compression_type(options.compression), true, &observer,
@@ -436,6 +625,13 @@ Result Device::pull(const std::string& remote, const std::string& local,
         fill_transfer_stats(result, bytes, counters.on_wire, transfer_duration);
         op.progress(bytes, bytes, true);
         if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
+    } else if (deadline.reason != Status::Ok) {
+        fill_transfer_stats(result, counters.payload, counters.on_wire, transfer_duration);
+        result.status = deadline.reason;
+        result.error = deadline.reason == Status::StallTimeout
+                               ? "pull stalled: no progress within the stall timeout"
+                               : "pull exceeded the total transfer timeout";
+        impl_->listener->take_error();
     } else {
         result.status = Status::IoError;
         result.error = impl_->listener->take_error();
@@ -446,7 +642,7 @@ Result Device::pull(const std::string& remote, const std::string& local,
 }
 
 Result Device::Impl::run_shell(const std::string& command, const ShellOptions& options,
-                               internal::OperationContext* op) {
+                               internal::OperationContext* op, ms timeout) {
     const auto started = clock_type::now();
 
     Result result;
@@ -465,9 +661,24 @@ Result Device::Impl::run_shell(const std::string& command, const ShellOptions& o
         return result;
     }
 
-    result.exit_code = session->wait();
+    // waitFor() сам прерывает сессию по истечении таймаута, иначе reader-поток
+    // висел бы на adb_read() до конца жизни процесса (§14 п.4).
+    const unsigned wait_ms =
+        timeout > ms::zero() ? static_cast<unsigned>(timeout.count()) : 0u;
+    int exit_code = 0;
+    const bool finished = session->waitFor(wait_ms, &exit_code);
     listener->clear_output_target();
 
+    if (!finished) {
+        result.status = Status::CommandTimeout;
+        result.phase = Phase::Transfer;
+        result.exit_code = -1;
+        result.error = "command timed out after " + std::to_string(timeout.count()) + " ms";
+        result.duration = elapsed_since(started);
+        return result;
+    }
+
+    result.exit_code = exit_code;
     result.phase = Phase::Finalize;
     result.duration = elapsed_since(started);
     // Ненулевой код возврата команды — не ошибка транспорта: status остаётся Ok,
@@ -486,7 +697,8 @@ Result Device::shell(const std::string& command, const ShellOptions& options) {
     }
 
     op.set_phase(Phase::Transfer);
-    Result result = impl_->run_shell(command, options, &op);
+    const ms timeout = options.timeout.value_or(internal::current_timeouts().shell);
+    Result result = impl_->run_shell(command, options, &op, timeout);
     op.set_phase(result.phase);
     op.finish(result);
     return result;
@@ -530,32 +742,59 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     impl_->listener->set_output_target(target);
 
     internal::emit_log(LogLevel::Info, impl_->serial, "install " + apk_path);
-    // Разделение фаз install по таймаутам — этап 7; сейчас событиями отмечаем
-    // только переход к заливке и коммиту, чтобы подписчик видел прогресс работ.
-    op.set_phase(Phase::Transfer);
+    op.set_phase(Phase::CreateSession);
+
+    const InstallTimeout timeout = options.timeout.value_or(internal::current_timeouts().install);
+    const uint64_t apk_size = file_size(apk_path);
+
+    InstallMonitor monitor;
+    monitor.timeout = timeout;
+    monitor.started = clock_type::now();
+
+    TransferCounters counters;
+    counters.expected = apk_size;
+
+    // Наблюдатель заливки: тот же, что у sync (install льёт apk через
+    // copy_to_file()). Дополнительно кормит монитор фаз.
+    SyncProgressObserver observer;
+    observer.on_progress = [&](const std::string&, uint64_t done, uint64_t /*total*/) {
+        counters.payload = done;
+        monitor.bytes.store(done, std::memory_order_relaxed);
+        monitor.last_progress_ms.store(monitor.now_ms(), std::memory_order_relaxed);
+        monitor.transfer_started.store(true, std::memory_order_relaxed);
+        op.progress(done, apk_size);
+        if (options.on_progress) options.on_progress(impl_->serial, done, apk_size);
+    };
+    observer.on_wire_bytes = [&counters](uint64_t bytes) { counters.on_wire += bytes; };
+    observer.should_abort = [&monitor] { return monitor.abort.load(std::memory_order_relaxed); };
+
+    const auto transfer_started = clock_type::now();
+
     // Статусные строки pm ("Success"/"Failure [...]") приходят не через shell-канал,
     // а из кода установки, который печатал их в stdout процесса. Перенаправляем их
     // в result.output: библиотека не должна писать в консоль приложения.
-    adb_install_set_status_sink(&result.output);
+    // Оба перехвата thread_local, поэтому ставим их внутри рабочего потока.
+    std::atomic<bool> install_ok{false};
+    std::atomic<bool> install_done{false};
+    std::thread worker([&] {
+        adb_install_set_status_sink(&result.output);
+        const SyncProgressObserver* previous = adb_sync_set_observer(&observer);
+        AdbInstaller installer(impl_->device);
+        install_ok.store(installer.install({apk_path}, flags), std::memory_order_release);
+        adb_sync_set_observer(previous);
+        adb_install_set_status_sink(nullptr);
+        install_done.store(true, std::memory_order_release);
+    });
 
-    // Прогресс заливки apk: install льёт файл через copy_to_file(), там стоит
-    // тот же хук наблюдателя, что и в sync.
-    const uint64_t apk_size = file_size(apk_path);
-    TransferCounters counters;
-    counters.expected = apk_size;
-    const SyncProgressObserver observer =
-        make_observer(op, impl_->serial, options.on_progress, counters);
-    const SyncProgressObserver* previous_observer = adb_sync_set_observer(&observer);
+    monitor_install(*impl_, op, monitor, install_done);
 
-    const auto transfer_started = clock_type::now();
-    AdbInstaller installer(impl_->device);
-    const bool ok = installer.install({apk_path}, flags);
+    // Даже решив прерваться, дожидаемся рабочий поток: он держит ссылки на
+    // result.output, наблюдателя и AdbDevice.
+    worker.join();
+    const bool ok = install_ok.load(std::memory_order_acquire) && monitor.reason == Status::Ok;
     const ms transfer_duration = elapsed_since(transfer_started);
 
-    adb_sync_set_observer(previous_observer);
-    adb_install_set_status_sink(nullptr);
     impl_->listener->clear_output_target();
-
     impl_->device->clearActiveSessions();
 
     result.duration = elapsed_since(started);
@@ -568,6 +807,17 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
         op.set_phase(Phase::Finalize);
         op.progress(bytes, bytes, true);
         if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
+        op.finish(result);
+        return result;
+    }
+
+    // Установку прервали мы сами (таймаут фазы или потеря устройства) — статус
+    // берём от монитора, а не выдаём за отказ pm.
+    if (monitor.reason != Status::Ok) {
+        result.phase = monitor.phase;
+        result.status = monitor.reason;
+        result.exit_code = -1;
+        result.error = monitor.message;
         op.finish(result);
         return result;
     }
@@ -616,7 +866,8 @@ Result Device::uninstall(const std::string& package, const UninstallOptions& opt
     // Через run_shell(), а не через shell(): вторая операция с собственным
     // OperationId здесь была бы лишней — событие уже одно, uninstall.
     op.set_phase(Phase::Transfer);
-    Result result = impl_->run_shell(command, shell_options, &op);
+    Result result = impl_->run_shell(command, shell_options, &op,
+                                     options.timeout.value_or(internal::current_timeouts().uninstall));
     result.duration = elapsed_since(started);
     result.phase = Phase::Finalize;
     op.set_phase(Phase::Finalize);
@@ -651,7 +902,8 @@ std::optional<std::string> Device::get_prop(const std::string& name) {
     // Служебный вызов: отдельной операции и событий не заводим, иначе каждый
     // getprop засорял бы поток событий приложения.
     if (!is_online()) return std::nullopt;
-    Result result = impl_->run_shell("getprop " + name, options, nullptr);
+    Result result = impl_->run_shell("getprop " + name, options, nullptr,
+                                     internal::current_timeouts().shell);
     if (!result.ok()) return std::nullopt;
 
     std::string value = android::base::Trim(result.output);

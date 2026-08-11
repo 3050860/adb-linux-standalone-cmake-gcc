@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
 
     libadb::Options options;
     options.max_connections = 1;   // один слот на весь процесс
-    options.slot_acquire = libadb::ms{0};  // не ждать: сразу SlotBusy
+    options.timeouts.slot_acquire = libadb::ms{0};  // не ждать: сразу SlotBusy
     client.initialize(options);
 
     check(client.max_connections() == 1, "limit applied from Options",
@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     // --- 2. Конечный таймаут ожидания -> SlotTimeout ------------------------
     client.set_max_connections(1);
     libadb::Options waiting = options;
-    waiting.slot_acquire = libadb::ms{700};
+    waiting.timeouts.slot_acquire = libadb::ms{700};
     client.initialize(waiting);
 
     const auto timeout_started = clock_type::now();
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
 
     // --- 3. Освобождение слота будит ожидающего -----------------------------
     libadb::Options patient = options;
-    patient.slot_acquire = libadb::ms{15000};
+    patient.timeouts.slot_acquire = libadb::ms{15000};
     client.initialize(patient);
 
     std::atomic<bool> waiter_done{false};
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
     libadb::Options batch = options;
     batch.max_connections = 1;
     batch.max_parallel = 4;                  // потоков больше, чем слотов
-    batch.slot_acquire = libadb::ms{30000};
+    batch.timeouts.slot_acquire = libadb::ms{30000};
     client.initialize(batch);
 
     std::atomic<size_t> peak{0};

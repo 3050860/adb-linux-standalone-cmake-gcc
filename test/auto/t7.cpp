@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
 
     auto& client = libadb::Client::instance();
     libadb::Options options;
-    options.connect_timeout = libadb::ms{8000};
+    options.timeouts.connect = libadb::ms{8000};
     client.initialize(options);
 
     auto device = client.connect(addrs[0]);

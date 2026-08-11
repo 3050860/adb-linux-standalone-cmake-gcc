@@ -519,3 +519,121 @@ PASSED на 192.168.177.249)**
 - `install` отдаёт прогресс одной сплошной фазой; разбивка по
   `Prepare/CreateSession/Transfer/Commit` со своими таймаутами — этап 7.
 
+## Этап 7 — таймауты и health-check коммита (§6, §14 п.4)
+
+**Что сделано**
+
+Закрыт пункт 4 §14: `AdbSession::waitFor(timeout_ms, &exit_code)` — ждёт
+`exit_code_future_` не дольше таймаута и по истечении сам вызывает `abort()`.
+Без `abort()` reader-поток остался бы висеть на `adb_read()` до конца жизни
+процесса.
+
+Публичный API (§6):
+
+- `TransferTimeout{total, stall}` — по умолчанию `total = 0` (выключен),
+  `stall = 30 s`.
+- `HealthCheckMode{None, Transport, Shell}` + `to_string()`.
+- `InstallTimeout{prepare, create_session, transfer, commit,
+  commit_healthcheck, commit_healthcheck_interval, commit_healthcheck_failures}`.
+- `Timeouts{connect, slot_acquire, shell, push, pull, install, uninstall, close}`.
+- `Options::timeouts` — **`Options::connect_timeout` и `Options::slot_acquire`
+  переехали внутрь `Timeouts`** (`timeouts.connect`, `timeouts.slot_acquire`),
+  как и предписано §6.3. Тесты `t4`–`t7` и `test_012` обновлены на новые имена.
+- `Client::set_timeouts()/timeouts()`.
+- Точечные `std::optional<...> timeout` в `PushOptions`, `PullOptions`,
+  `ShellOptions`, `InstallOptions`, `UninstallOptions`.
+
+Реализация:
+
+- `internal::current_timeouts()` — операции читают таймауты на старте, поэтому
+  `set_timeouts()` действует на всё, что начнётся после вызова, и не ломает уже
+  идущие операции.
+- `TransferDeadline` в `device.cpp` — общий и stall-дедлайн; `touch()` на каждом
+  событии прогресса, `should_abort` наблюдателя (этап 6) отдаёт `true` по
+  истечении. Результат: `Status::CommandTimeout` для `total`,
+  `Status::StallTimeout` для `stall`, `Result::transfer` при этом заполнен тем,
+  что успело пройти.
+- `Device::Impl::run_shell(..., ms timeout)` → `AdbSession::waitFor()`;
+  по таймауту `Status::CommandTimeout`, `exit_code = -1`.
+- `install` теперь выполняется в **рабочем потоке**, а вызывающий поток крутит
+  `monitor_install()`: шаг 100 мс, отслеживание фаз, дедлайны фаз, health-check.
+
+**Как определяются фазы install**
+
+Установка — это один блокирующий `install_multiple_app()`, отдельных сигналов
+«install-create ответил» / «install-write закончился» у него нет. Поэтому фазы
+выводятся из наблюдаемых признаков:
+
+- байты ещё не пошли → `CreateSession` (дедлайн `create_session`);
+- байты идут → `Transfer` (дедлайн `transfer.total`/`transfer.stall`);
+- байты кончились и тишина дольше секунды → `Commit`.
+
+На фазе `Commit` прогресса нет принципиально, поэтому вместо угадывания времени
+установки работает health-check: раз в `commit_healthcheck_interval` проверяем
+живость и публикуем `OperationHeartbeat`; `commit_healthcheck_failures` неудач
+подряд → `Status::DeviceLost`. Режимы: `Transport` (проверка транспорта и
+состояния устройства, ничего не запускает на устройстве) и `Shell` (короткая
+команда `true` со своим таймаутом 10 с — строже, но создаёт процесс на
+устройстве на каждую проверку).
+
+**Принятые решения и грабли**
+
+1. **`install` в отдельном потоке, а не таймер поверх блокирующего вызова.**
+   Иначе фазовые дедлайны и heartbeat невозможны: `install_multiple_app()`
+   не возвращает управление до конца.
+2. **`adb_install_set_status_sink()` и `adb_sync_set_observer()` ставятся
+   ВНУТРИ рабочего потока.** Оба перехвата `thread_local`; поставленные в
+   вызывающем потоке, они бы просто не действовали на поток установки — вывод
+   `pm` уехал бы в stdout, а прогресса не было бы вовсе.
+3. **`worker.join()` выполняется всегда**, даже когда мы уже решили прерваться:
+   рабочий поток держит ссылки на `result.output`, наблюдателя и `AdbDevice`.
+4. **Причина срыва хранится отдельно от `expired()`.** После прерывания
+   `expired()` уже неинформативен, а `Result` формируется позже — поэтому
+   `TransferDeadline::reason` и `InstallMonitor::reason/phase/message`
+   запоминаются в момент решения.
+5. **Прерванная передача — не `IoError`.** Ветка `deadline.reason != Ok`
+   ставит именно `CommandTimeout`/`StallTimeout` и глотает сообщение sync об
+   обрыве (`take_error()`), чтобы оно не подменяло причину.
+6. **Убраны `Error()` из веток прерывания в `file_sync_client.cpp`.**
+   `SyncConnection::Error()` печатает в **stderr приложения**
+   (`LinePrinter` игнорирует `quiet_` для типа ERROR), и на каждом таймауте в
+   консоль вызывающего лезло `adb: error: transfer of '...' aborted`.
+   Прерывание случается только по нашей же просьбе, причина уже в `Result`.
+7. **Фаза `Transfer` у install определяется «прогресс был свежее секунды».**
+   Порог меньше давал ложные переходы в `Commit` на паузах между блоками.
+8. **`HealthCheckMode::Shell` использует свой таймаут (10 с), а не
+   `Timeouts::shell`**: проверка живости не должна ждать столько же, сколько
+   сама установка.
+
+**Что проверено (`test/auto/test_015_timeouts.cpp`, 28 проверок, ALL PASSED на
+192.168.177.249)**
+
+- `Timeouts` читаются из `Options` (`shell = 3000`, `connect = 20000`),
+  дефолты соответствуют §6 (`push.stall = 30000`, `push.total = 0`,
+  health-check `Transport`), `set_timeouts()` меняет их в рантайме;
+- `shell("sleep 30")` при `Timeouts::shell = 3 s` срывается ровно через 3000 мс
+  со `Status::CommandTimeout`, приходит одно `OperationTimeout`, **устройство
+  остаётся online**, следующая команда работает;
+- `ShellOptions::timeout = 20 s` перебивает глобальные 3 с: `sleep 5` доходит
+  до конца (5042 мс);
+- push 48 МиБ с `total = 800 ms` срывается через 830 мс со `CommandTimeout`,
+  успев передать ~9 МБ; событие `OperationTimeout` пришло; устройство живо;
+- push с `stall = 5 s` и `total = 0` доходит до конца (50 331 648 байт) —
+  stall-таймер сбрасывается прогрессом, ложных срывов нет;
+- `total = 0, stall = 0` — без ограничения, передача проходит целиком;
+- install с фазовыми таймаутами проходит успешно, в событиях есть фазы
+  `Transfer` и `Commit`, health-check прислал 37 `OperationHeartbeat`;
+- install с `create_session = 1 ms` не ломается (либо `CommandTimeout`, либо
+  pm успевает ответить быстрее шага монитора 100 мс).
+
+Регрессии: `test_011`, `test_012`, `test_013`, `test_014` — ALL PASSED;
+`adirect` собирается и работает.
+
+**Что осталось**
+
+- `Timeouts::close` и `InstallTimeout::prepare` объявлены, но пока ни на что не
+  влияют: закрытие транспорта в текущей реализации не блокирующее, а фаза
+  `Prepare` (распаковка `.apks`) появится на этапе 9.
+- Отмена операций пользователем (`cancel/cancel_all/close_all`) и асинхронный
+  режим — этап 8; механизм прерывания (`should_abort`) для них уже готов.
+

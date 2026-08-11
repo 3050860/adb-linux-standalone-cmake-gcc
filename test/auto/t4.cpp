@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     if (addrs.empty()) addrs = {"192.168.177.248", "192.168.177.249"};
 
     libadb::Options options;
-    options.connect_timeout = libadb::ms{8000};
+    options.timeouts.connect = libadb::ms{8000};
     options.log_sink = [](libadb::LogLevel level, const std::string& serial,
                           std::string_view msg) {
         printf("  [%s] %s%s%.*s\n", libadb::to_string(level), serial.c_str(),

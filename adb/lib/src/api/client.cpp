@@ -243,7 +243,7 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
 
     // Слот занимаем до создания транспорта: лимит должен считать реально
     // открытые соединения, а не успешные подключения.
-    const Status slot_status = impl_->slots.acquire(options.slot_acquire, serial);
+    const Status slot_status = impl_->slots.acquire(options.timeouts.slot_acquire, serial);
     if (slot_status != Status::Ok) {
         set_status(slot_status);
         internal::emit_log(LogLevel::Warn, serial,
@@ -254,7 +254,7 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
     auto impl = std::make_unique<Device::Impl>();
     impl->address = address;
     impl->serial = serial;
-    impl->connect_timeout = options.connect_timeout;
+    impl->connect_timeout = options.timeouts.connect;
     impl->listener = std::make_unique<internal::FacadeListener>(serial);
     // Дальше любой выход из функции проходит через Impl::close() — прямо или
     // через деструктор Impl, — поэтому слот вернётся в пул при любом исходе.
@@ -274,7 +274,7 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
         return nullptr;
     }
 
-    const Status wait_status = impl->listener->wait_until_online(options.connect_timeout);
+    const Status wait_status = impl->listener->wait_until_online(options.timeouts.connect);
     if (wait_status != Status::Ok) {
         set_status(wait_status);
         internal::emit_log(LogLevel::Error, serial,
@@ -422,6 +422,26 @@ size_t Client::max_connections() const {
 size_t Client::active_connections() const {
     return impl_->slots.active();
 }
+
+void Client::set_timeouts(const Timeouts& timeouts) {
+    std::unique_lock<std::shared_mutex> lock(impl_->mutex);
+    impl_->options.timeouts = timeouts;
+}
+
+Timeouts Client::timeouts() const {
+    std::shared_lock<std::shared_mutex> lock(impl_->mutex);
+    return impl_->options.timeouts;
+}
+
+namespace internal {
+
+Timeouts current_timeouts() {
+    // Через публичный интерфейс: единственное место, где живут настройки, —
+    // Client::Impl, и лезть в него из device.cpp напрямую незачем.
+    return Client::instance().timeouts();
+}
+
+}  // namespace internal
 
 SubscriptionId Client::subscribe(EventFn handler, EventMask mask) {
     return internal::EventBus::instance().subscribe(std::move(handler), mask);

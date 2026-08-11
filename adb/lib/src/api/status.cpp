@@ -49,6 +49,15 @@ const char* to_string(Command c) {
     return "unknown";
 }
 
+const char* to_string(HealthCheckMode m) {
+    switch (m) {
+        case HealthCheckMode::None:      return "none";
+        case HealthCheckMode::Transport: return "transport";
+        case HealthCheckMode::Shell:     return "shell";
+    }
+    return "unknown";
+}
+
 const char* to_string(Phase p) {
     switch (p) {
         case Phase::None:          return "none";
