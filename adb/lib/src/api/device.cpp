@@ -308,6 +308,70 @@ std::string parse_failure_code(const std::string& output) {
     return output.substr(code_start, end - code_start);
 }
 
+// Раскладывает код отказа pm в Status (§10). Код уже вынут из "Failure [CODE]".
+Status status_from_install_code(const std::string& code) {
+    if (code.empty()) return Status::RemoteError;
+
+    // INSTALL_PARSE_FAILED_* — целое семейство (NOT_APK, BAD_MANIFEST,
+    // NO_CERTIFICATES, ...), все означают «apk не годится».
+    if (code.rfind("INSTALL_PARSE_FAILED_", 0) == 0) return Status::InvalidApk;
+
+    if (code == "INSTALL_FAILED_UPDATE_INCOMPATIBLE") return Status::SignatureMismatch;
+    if (code == "INSTALL_FAILED_VERSION_DOWNGRADE") return Status::VersionDowngrade;
+    if (code == "INSTALL_FAILED_INSUFFICIENT_STORAGE") return Status::InsufficientStorage;
+    if (code == "INSTALL_FAILED_INVALID_APK") return Status::InvalidApk;
+    if (code == "INSTALL_FAILED_MISSING_SPLIT") return Status::MissingSplit;
+
+    // Всё остальное (INSTALL_FAILED_TEST_ONLY, INSTALL_FAILED_USER_RESTRICTED,
+    // DELETE_FAILED_*, ...) — RemoteError с сохранением кода в remote_code.
+    return Status::RemoteError;
+}
+
+bool ends_with_ignore_case(const std::string& text, const char* suffix) {
+    return android::base::EndsWithIgnoreCase(text, suffix);
+}
+
+// Определяет InstallKind для Auto по составу списка файлов (§10).
+InstallKind resolve_install_kind(InstallKind requested, const std::vector<std::string>& paths) {
+    if (requested != InstallKind::Auto) return requested;
+    if (paths.size() == 1) {
+        // .apks/.zip — бандл bundletool: распакуем и поставим как SplitSet.
+        if (ends_with_ignore_case(paths[0], ".apks") || ends_with_ignore_case(paths[0], ".zip")) {
+            return InstallKind::Bundle;
+        }
+        return InstallKind::Single;
+    }
+    // Несколько файлов по умолчанию считаем частями ОДНОГО пакета: это самый
+    // частый случай (base + split_config.*). Независимые пакеты вызывающий
+    // должен запросить явно — MultiPackage меняет семантику на атомарную
+    // сессию, и угадывать это по именам файлов было бы гаданием.
+    return InstallKind::SplitSet;
+}
+
+// Пытается вытащить имя пакета из текста ошибки pm. Прошивки пишут разное,
+// но чаще всего имя присутствует в сообщении:
+//   "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package com.example
+//    signatures do not match previously installed version; ignoring!]"
+std::string package_name_from_output(const std::string& output) {
+    static const char* const kMarkers[] = {"Package ", "package "};
+    for (const char* marker : kMarkers) {
+        size_t pos = output.find(marker);
+        while (pos != std::string::npos) {
+            const size_t start = pos + strlen(marker);
+            const size_t end = output.find_first_of(" \t\r\n:;,]", start);
+            std::string candidate = output.substr(start, end == std::string::npos ? end
+                                                                                 : end - start);
+            // Имя пакета обязано содержать точку и не быть похожим на путь.
+            if (candidate.find('.') != std::string::npos &&
+                candidate.find('/') == std::string::npos && candidate.size() > 2) {
+                return candidate;
+            }
+            pos = output.find(marker, start);
+        }
+    }
+    return {};
+}
+
 // Готовит Result для случая «устройство уже закрыто/потеряно».
 Result device_lost_result(Command command) {
 
@@ -780,33 +844,14 @@ Result Device::shell(const std::string& command, const ShellOptions& options) {
     return result;
 }
 
-Result Device::install(const std::string& apk_path, const InstallOptions& options) {
+Result Device::Impl::run_install_attempt(const std::vector<std::string>& paths,
+                                         const std::vector<std::string>& flags,
+                                         bool multi_package, uint64_t total_size,
+                                         const InstallOptions& options,
+                                         const InstallTimeout& timeout,
+                                         internal::OperationContext& op) {
     const auto started = clock_type::now();
-    internal::OperationContext op(Command::Install, impl_->serial);
-    op.start(options.on_start);
-
-    if (!is_online()) {
-        Result result = device_lost_result(Command::Install);
-        op.finish(result);
-        return result;
-    }
-
-    op.set_phase(Phase::Prepare);
-    if (file_size(apk_path) == 0) {
-        Result result;
-        result.status = Status::LocalFileError;
-        result.phase = Phase::Prepare;
-        result.error = "apk not found or empty: " + apk_path;
-        result.duration = elapsed_since(started);
-        op.finish(result);
-        return result;
-    }
-
-    std::vector<std::string> flags;
-    if (options.reinstall) flags.push_back("-r");
-    if (options.allow_downgrade) flags.push_back("-d");
-    if (options.grant_permissions) flags.push_back("-g");
-    flags.insert(flags.end(), options.extra_args.begin(), options.extra_args.end());
+    const uint64_t apk_size = total_size;
 
     Result result;
     // Вывод pm приходит теми же событиями, что и shell: собираем его, чтобы
@@ -815,13 +860,9 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     target.buffer = &result.output;
     if (options.on_output) target.callback = &options.on_output;
     target.op = &op;
-    impl_->listener->set_output_target(target);
+    listener->set_output_target(target);
 
-    internal::emit_log(LogLevel::Info, impl_->serial, "install " + apk_path);
     op.set_phase(Phase::CreateSession);
-
-    const InstallTimeout timeout = options.timeout.value_or(internal::current_timeouts().install);
-    const uint64_t apk_size = file_size(apk_path);
 
     InstallMonitor monitor;
     monitor.timeout = timeout;
@@ -839,7 +880,7 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
         monitor.last_progress_ms.store(monitor.now_ms(), std::memory_order_relaxed);
         monitor.transfer_started.store(true, std::memory_order_relaxed);
         op.progress(done, apk_size);
-        if (options.on_progress) options.on_progress(impl_->serial, done, apk_size);
+        if (options.on_progress) options.on_progress(serial, done, apk_size);
     };
     observer.on_wire_bytes = [&counters](uint64_t bytes) { counters.on_wire += bytes; };
     observer.should_abort = [&monitor] { return monitor.abort.load(std::memory_order_relaxed); };
@@ -855,14 +896,15 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     std::thread worker([&] {
         adb_install_set_status_sink(&result.output);
         const SyncProgressObserver* previous = adb_sync_set_observer(&observer);
-        AdbInstaller installer(impl_->device);
-        install_ok.store(installer.install({apk_path}, flags), std::memory_order_release);
+        AdbInstaller installer(device);
+        install_ok.store(installer.install(paths, flags, multi_package),
+                         std::memory_order_release);
         adb_sync_set_observer(previous);
         adb_install_set_status_sink(nullptr);
         install_done.store(true, std::memory_order_release);
     });
 
-    monitor_install(*impl_, op, monitor, install_done);
+    monitor_install(*this, op, monitor, install_done);
 
     // Даже решив прерваться, дожидаемся рабочий поток: он держит ссылки на
     // result.output, наблюдателя и AdbDevice.
@@ -870,8 +912,8 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     const bool ok = install_ok.load(std::memory_order_acquire) && monitor.reason == Status::Ok;
     const ms transfer_duration = elapsed_since(transfer_started);
 
-    impl_->listener->clear_output_target();
-    impl_->device->clearActiveSessions();
+    listener->clear_output_target();
+    device->clearActiveSessions();
 
     result.duration = elapsed_since(started);
     // Байты берём от наблюдателя: install-write мог залить не весь файл (ошибка),
@@ -882,19 +924,17 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
         result.phase = Phase::Finalize;
         op.set_phase(Phase::Finalize);
         op.progress(bytes, bytes, true);
-        if (options.on_progress) options.on_progress(impl_->serial, bytes, bytes);
-        op.finish(result);
+        if (options.on_progress) options.on_progress(serial, bytes, bytes);
         return result;
     }
 
-    // Установку прервали мы сами (таймаут фазы или потеря устройства) — статус
-    // берём от монитора, а не выдаём за отказ pm.
+    // Установку прервали мы сами (таймаут фазы, отмена или потеря устройства) —
+    // статус берём от монитора, а не выдаём за отказ pm.
     if (monitor.reason != Status::Ok) {
         result.phase = monitor.phase;
         result.status = monitor.reason;
         result.exit_code = -1;
         result.error = monitor.message;
-        op.finish(result);
         return result;
     }
 
@@ -903,12 +943,170 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     // Код отказа берём из "Failure [CODE...]" — так ловятся и INSTALL_FAILED_*,
     // и INSTALL_PARSE_FAILED_*, которые pm печатает в том же формате.
     result.remote_code = parse_failure_code(result.output);
-    result.status = Status::RemoteError;
+    // Раскладываем код в Status (§10): SignatureMismatch, VersionDowngrade,
+    // InsufficientStorage, InvalidApk, MissingSplit, иначе RemoteError.
+    result.status = status_from_install_code(result.remote_code);
     result.error = result.remote_code.empty() ? "install failed" : result.remote_code;
     op.set_phase(Phase::Commit);
+    return result;
+}
+
+Result Device::install(const std::string& apk_path, const InstallOptions& options) {
+    return install(std::vector<std::string>{apk_path}, options);
+}
+
+Result Device::install(const std::vector<std::string>& paths, const InstallOptions& options) {
+    const auto started = clock_type::now();
+    internal::OperationContext op(Command::Install, impl_->serial);
+    op.start(options.on_start);
+
+    const auto fail = [&](Status status, Phase phase, std::string message) {
+        Result result;
+        result.status = status;
+        result.phase = phase;
+        result.error = std::move(message);
+        result.duration = elapsed_since(started);
+        op.finish(result);
+        return result;
+    };
+
+    if (paths.empty()) return fail(Status::InvalidArgument, Phase::Prepare, "no files to install");
+
+    // ReinstallKeepData заявлен в API, но обещать сохранение данных мы не будем:
+    // `pm uninstall -k` с чужой подписью не спасает и на многих прошивках
+    // объявлен нерабочим (§10).
+    if (options.on_conflict == ConflictPolicy::ReinstallKeepData) {
+        return fail(Status::NotImplemented, Phase::Prepare,
+                    "ConflictPolicy::ReinstallKeepData is reserved and not implemented");
+    }
+
+    if (!is_online()) {
+        Result result = device_lost_result(Command::Install);
+        op.finish(result);
+        return result;
+    }
+
+    // --- фаза Prepare: проверка файлов и распаковка бандла --------------------
+    op.set_phase(Phase::Prepare);
+    const InstallTimeout timeout = options.timeout.value_or(internal::current_timeouts().install);
+    const InstallKind kind = resolve_install_kind(options.kind, paths);
+
+    for (const auto& path : paths) {
+        if (file_size(path) == 0) {
+            return fail(Status::LocalFileError, Phase::Prepare, "file not found or empty: " + path);
+        }
+    }
+    if (kind == InstallKind::Single && paths.size() > 1) {
+        return fail(Status::InvalidArgument, Phase::Prepare,
+                    "InstallKind::Single expects exactly one file");
+    }
+
+    // Бандл распаковываем сами, до запуска pm: так фаза Prepare честно
+    // укладывается в свой таймаут, а состав пакета известен заранее (нужен для
+    // общего размера, то есть для прогресса).
+    std::vector<std::string> files = paths;
+    bool expanded = false;
+    if (kind == InstallKind::Bundle) {
+        const auto prepare_started = clock_type::now();
+        files = AdbInstaller::expandApks(paths);
+        if (files.empty()) {
+            return fail(Status::InvalidApk, Phase::Prepare,
+                        "cannot expand bundle (.apks/.zip): no apk inside or unzip failed");
+        }
+        expanded = true;
+        if (timeout.prepare > ms::zero() && elapsed_since(prepare_started) > timeout.prepare) {
+            AdbInstaller::cleanupExpanded(files);
+            return fail(Status::CommandTimeout, Phase::Prepare,
+                        "unpacking the bundle took longer than InstallTimeout::prepare");
+        }
+    }
+
+    uint64_t total_size = 0;
+    for (const auto& file : files) total_size += file_size(file);
+
+    // --- флаги pm ------------------------------------------------------------
+    std::vector<std::string> flags;
+    if (options.reinstall) flags.push_back("-r");
+    if (options.allow_downgrade) flags.push_back("-d");
+    if (options.grant_permissions) flags.push_back("-g");
+    if (options.user_id >= 0) {
+        flags.push_back("--user");
+        flags.push_back(std::to_string(options.user_id));
+    }
+    flags.insert(flags.end(), options.extra_args.begin(), options.extra_args.end());
+
+    const bool multi_package = kind == InstallKind::MultiPackage;
+
+    internal::emit_log(LogLevel::Info, impl_->serial,
+                       std::string("install ") + to_string(kind) + ": " + files.front() +
+                               (files.size() > 1
+                                        ? " (+" + std::to_string(files.size() - 1) + " more)"
+                                        : ""));
+
+    Result result = impl_->run_install_attempt(files, flags, multi_package, total_size, options,
+                                               timeout, op);
+
+    // --- повтор при downgrade ------------------------------------------------
+    if (result.status == Status::VersionDowngrade && options.allow_downgrade_retry &&
+        !options.allow_downgrade && !op.canceled()) {
+        internal::emit_log(LogLevel::Warn, impl_->serial, "version downgrade: retrying with -d");
+        op.retry(Status::VersionDowngrade, "retrying install with -d");
+
+        std::vector<std::string> retry_flags = flags;
+        retry_flags.insert(retry_flags.begin(), "-d");
+        result = impl_->run_install_attempt(files, retry_flags, multi_package, total_size, options,
+                                           timeout, op);
+        result.retries += 1;
+    }
+
+    // --- повтор при конфликте подписи (§10) ----------------------------------
+    // Никакой флаг pm тут не поможет: единственный путь без root — удалить пакет
+    // и поставить заново, данные при этом теряются. Делаем это только по явной
+    // просьбе (ConflictPolicy::Reinstall) и только зная имя пакета.
+    if (result.status == Status::SignatureMismatch &&
+        options.on_conflict == ConflictPolicy::Reinstall && !op.canceled()) {
+        std::string package = options.package_name;
+        // Explicit — только то, что передали. Auto/Both умеют ещё вытащить имя
+        // из текста ошибки pm; разбор AndroidManifest.xml — этап 10.
+        if (options.package_name_source != PackageNameSource::Explicit &&
+            (package.empty() || options.package_name_source == PackageNameSource::Auto)) {
+            const std::string detected = package_name_from_output(result.output);
+            if (!detected.empty()) package = detected;
+        }
+
+        if (package.empty()) {
+            result.error = "signature mismatch: package name is unknown, set "
+                           "InstallOptions::package_name";
+            if (options.package_name_source == PackageNameSource::Explicit) {
+                result.status = Status::InvalidArgument;
+            }
+        } else {
+            internal::emit_log(LogLevel::Warn, impl_->serial,
+                               "signature mismatch: reinstalling " + package +
+                                       " (application data will be lost)");
+            op.retry(Status::SignatureMismatch,
+                     "uninstalling " + package + " before reinstall (data will be lost)");
+
+            UninstallOptions uninstall_options;
+            const Result removed = uninstall(package, uninstall_options);
+            if (!removed.ok()) {
+                result.error =
+                        "signature mismatch: cannot uninstall " + package + ": " + removed.error;
+            } else {
+                result = impl_->run_install_attempt(files, flags, multi_package, total_size,
+                                                    options, timeout, op);
+                result.retries += 1;
+            }
+        }
+    }
+
+    // Временные каталоги распакованного бандла убираем сами: попытки могли
+    // повторяться, а expandApks() распаковывает ровно один раз.
+    if (expanded) AdbInstaller::cleanupExpanded(files);
+
+    result.duration = elapsed_since(started);
     op.finish(result);
     return result;
-
 }
 
 Result Device::uninstall(const std::string& package, const UninstallOptions& options) {
@@ -928,10 +1126,14 @@ Result Device::uninstall(const std::string& package, const UninstallOptions& opt
     // На старых прошивках 'cmd' отсутствует — выбираем инструмент до запуска,
     // а не по коду возврата: 'cmd package uninstall' умеет печатать Success и
     // при этом возвращать ненулевой код, из-за чего fallback стирал результат.
-    const std::string keep = options.keep_data ? " -k" : "";
+    std::string args = options.keep_data ? " -k" : "";
+    // --user N: сахар над тем же флагом pm (§9). Число подставляем сами, поэтому
+    // экранировать нечего.
+    if (options.user_id >= 0) args += " --user " + std::to_string(options.user_id);
+
     const std::string quoted = quote_arg(package);
     const std::string command = "if command -v cmd >/dev/null 2>&1; then cmd package uninstall" +
-                                keep + " " + quoted + "; else pm uninstall" + keep + " " + quoted +
+                                args + " " + quoted + "; else pm uninstall" + args + " " + quoted +
                                 "; fi 2>&1";
 
 
@@ -1040,9 +1242,14 @@ OperationPtr Device::shell_async(const std::string& command, const ShellOptions&
 }
 
 OperationPtr Device::install_async(const std::string& apk_path, const InstallOptions& options) {
+    return install_async(std::vector<std::string>{apk_path}, options);
+}
+
+OperationPtr Device::install_async(const std::vector<std::string>& paths,
+                                   const InstallOptions& options) {
     auto self = shared_from_this();
     return start_async(self, *impl_, Command::Install,
-                       [self, apk_path, options] { return self->install(apk_path, options); });
+                       [self, paths, options] { return self->install(paths, options); });
 }
 
 OperationPtr Device::uninstall_async(const std::string& package, const UninstallOptions& options) {

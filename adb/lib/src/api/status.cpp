@@ -49,6 +49,35 @@ const char* to_string(Command c) {
     return "unknown";
 }
 
+const char* to_string(InstallKind k) {
+    switch (k) {
+        case InstallKind::Auto:         return "auto";
+        case InstallKind::Single:       return "single";
+        case InstallKind::SplitSet:     return "split-set";
+        case InstallKind::Bundle:       return "bundle";
+        case InstallKind::MultiPackage: return "multi-package";
+    }
+    return "unknown";
+}
+
+const char* to_string(ConflictPolicy p) {
+    switch (p) {
+        case ConflictPolicy::Fail:              return "fail";
+        case ConflictPolicy::Reinstall:         return "reinstall";
+        case ConflictPolicy::ReinstallKeepData: return "reinstall-keep-data";
+    }
+    return "unknown";
+}
+
+const char* to_string(PackageNameSource s) {
+    switch (s) {
+        case PackageNameSource::Explicit: return "explicit";
+        case PackageNameSource::Auto:     return "auto";
+        case PackageNameSource::Both:     return "both";
+    }
+    return "unknown";
+}
+
 const char* to_string(HealthCheckMode m) {
     switch (m) {
         case HealthCheckMode::None:      return "none";

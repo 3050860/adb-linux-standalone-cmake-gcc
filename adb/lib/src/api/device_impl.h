@@ -111,6 +111,15 @@ struct LIBADB_INTERNAL Device::Impl {
     Result run_shell(const std::string& command, const ShellOptions& options,
                      internal::OperationContext* op, ms timeout);
 
+    // Одна попытка установки (§10): запускает pm в рабочем потоке и следит за
+    // фазами/таймаутами из вызывающего. Повторы (ConflictPolicy::Reinstall,
+    // allow_downgrade_retry) организует Device::install поверх этого метода.
+    // paths уже развёрнуты (bundle распакован), flags — готовые аргументы pm.
+    Result run_install_attempt(const std::vector<std::string>& paths,
+                               const std::vector<std::string>& flags, bool multi_package,
+                               uint64_t total_size, const InstallOptions& options,
+                               const InstallTimeout& timeout, internal::OperationContext& op);
+
     // Занято ли устройство асинхронной операцией. Синхронные вызовы этот флаг
     // не выставляют: их последовательность — забота вызывающего.
     std::atomic<bool> async_busy{false};

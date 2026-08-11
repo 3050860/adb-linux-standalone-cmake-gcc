@@ -753,3 +753,116 @@ PASSED; `adirect` собирается, `shell` и `push` на живом уст
 - `ShellSession` (этап 11) по-прежнему нет, поэтому ограничение «одна сессия на
   устройство» в силе.
 
+## Этап 9 — установка: split / `.apks` / multi-package, разбор ошибок pm (§10)
+
+**Что сделано**
+
+Публичный API:
+
+- `InstallKind{Auto, Single, SplitSet, Bundle, MultiPackage}`,
+  `ConflictPolicy{Fail, Reinstall, ReinstallKeepData}`,
+  `PackageNameSource{Explicit, Auto, Both}` + `to_string()` для всех трёх.
+- `InstallOptions` дополнен: `kind`, `on_conflict`, `package_name_source`,
+  `package_name`, `allow_downgrade_retry`, `user_id`.
+- `UninstallOptions::user_id` (сахар над `--user N`).
+- `Device::install(const std::vector<std::string>&, ...)` и
+  `Device::install_async(const std::vector<std::string>&, ...)`.
+
+Реализация:
+
+- `Device::install(paths, options)` — оркестратор: валидация, фаза `Prepare`
+  (проверка файлов, распаковка бандла), формирование флагов pm, вызов попытки,
+  повторы, очистка. Одиночный `install(apk)` теперь просто делегирует ему.
+- `Device::Impl::run_install_attempt()` — ровно одна попытка установки (рабочий
+  поток + `monitor_install` из этапа 7). Вынесено отдельно именно для повторов.
+- `status_from_install_code()` — раскладка кода pm в `Status` (§10):
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE` → `SignatureMismatch`,
+  `INSTALL_FAILED_VERSION_DOWNGRADE` → `VersionDowngrade`,
+  `INSTALL_FAILED_INSUFFICIENT_STORAGE` → `InsufficientStorage`,
+  `INSTALL_FAILED_INVALID_APK` и всё семейство `INSTALL_PARSE_FAILED_*` →
+  `InvalidApk`, `INSTALL_FAILED_MISSING_SPLIT` → `MissingSplit`, остальное →
+  `RemoteError` с сохранением кода в `remote_code`.
+- `resolve_install_kind()` для `Auto`, `package_name_from_output()` — извлечение
+  имени пакета из текста ошибки pm.
+- `AdbInstaller`: `install(paths, flags, multi_package)` (при `true` вызывается
+  `install_multi_package()` вместо `install_multiple_app()`),
+  `expandApks()`/`cleanupExpanded()` стали публичными и статическими.
+
+**Принятые решения и грабли**
+
+1. **`Auto` при нескольких файлах даёт `SplitSet`, а не `MultiPackage`.**
+   Части одного пакета — самый частый случай, а `MultiPackage` меняет семантику
+   на атомарную сессию; угадывать это по именам файлов было бы гаданием, поэтому
+   независимые пакеты вызывающий обязан запросить явно.
+2. **Бандл распаковывается в фасаде, а не внутри `AdbInstaller::install()`.**
+   Так фаза `Prepare` честно укладывается в свой таймаут
+   (`InstallTimeout::prepare`), а состав пакета известен до старта — значит,
+   известен и общий размер, то есть прогресс считается по всем частям, а не по
+   первому файлу. Повторной распаковки не происходит: `expandApks()` для готовых
+   `.apk` работает как passthrough.
+3. **`base.apk` в бандле ставится первым.** `pm` ожидает базовый пакет раньше
+   split-частей, а `readdir()` возвращает файлы в произвольном порядке.
+4. **Временный каталог распаковки — `/tmp/libadb_apks_*`** (было
+   `/tmp/adirect_apks_*`), чистится через `cleanupExpanded()` **в фасаде**, после
+   всех повторов: раньше очистка была внутри одной попытки, и второй заход
+   (`Reinstall`, downgrade-retry) не нашёл бы файлов.
+5. **`ReinstallKeepData` отвергается до обращения к устройству** —
+   `Status::NotImplemented`, ничего не передаётся (проверено тестом).
+6. **`ConflictPolicy::Reinstall` не удаляет «что-нибудь».** Имя пакета берётся
+   строго по `PackageNameSource`: `Explicit` — только переданное (иначе
+   `InvalidArgument`), `Auto`/`Both` — плюс разбор текста ошибки pm. Разбор
+   `AndroidManifest.xml` (AXML) — этап 10, до тех пор `Auto` умеет только текст.
+   Перед переустановкой публикуется `OperationRetry` с честной причиной
+   («data will be lost»), в `Result::retries` растёт счётчик.
+7. **Ещё пять мест, где внутренний код писал в консоль приложения.**
+   `install_multi_package()` печатал `Created parent/child session ID`,
+   финальный `Success`, `failed to link sessions`, `Attempting to abandon
+   session` и `multi-package install is not supported` прямо в stdout/stderr.
+   Всё переведено на уже существующий `report_status()`, поэтому у библиотеки это
+   попадает в `Result::output`, а у `adirect` (приёмник не задан) поведение
+   осталось прежним — проверено запуском `adirect install`.
+8. **`error_exit()` в `install_multi_package()` обойдён валидацией.** Функция
+   `[[noreturn]]`-убивает процесс, если последние аргументы не `.apk`/`.apex`;
+   фасад проверяет существование и непустоту всех файлов заранее, а после
+   распаковки на вход всегда идут `.apk`.
+
+**Что проверено (`test/auto/test_017_install_kinds.cpp`, 37 проверок, ALL PASSED
+на 192.168.177.249)**
+
+- пустой список → `InvalidArgument` (фаза `Prepare`), отсутствующий файл →
+  `LocalFileError`, `Single` с двумя файлами → `InvalidArgument`;
+- `ReinstallKeepData` → `NotImplemented`, `transfer.bytes == 0`;
+- `to_string()` для `InstallKind`/`ConflictPolicy`/`PackageNameSource`;
+- битый «apk» (текстовый мусор): `remote_code = INSTALL_PARSE_FAILED_NOT_APK`
+  разложен в `Status::InvalidApk`, пришло `OperationFailed`;
+- одиночный `install` с `user_id = 0` — успех, 60 728 027 байт, фазы `Prepare` и
+  `Transfer`, одно `OperationFinished`, статус pm в `output`;
+- `.apks` (Auto → Bundle): распаковался, установился, временные каталоги
+  `/tmp/libadb_apks_*` удалены;
+- `SplitSet` и `MultiPackage` доходят до pm и возвращают внятный результат,
+  устройство остаётся online (multi-package на этом устройстве прошёл успешно:
+  в `output` видны `Created parent session ID` / `Created child session ID`);
+- `ConflictPolicy::Reinstall` с явным именем пакета не мешает обычной установке
+  (`retries == 0`), пакет остаётся на устройстве;
+- `install_async(vector)` возвращает операцию, дожидается и даёт `Ok`.
+
+Бандл `.apks` для теста готовится из `test/main.apk` (внутри должен быть
+`base.apk`), команда приведена в шапке теста.
+
+Регрессии: `test_011`, `test_012`, `test_013`, `test_014`, `test_015`,
+`test_016` — ALL PASSED; `adirect install/push/shell` на живом устройстве
+работают, консольный вывод не изменился. Внутренних символов в динамической
+таблице `.so` нет (105 публичных).
+
+**Что осталось**
+
+- Настоящий конфликт подписи в тесте не воспроизведён: нужен apk, подписанный
+  другим ключом. Проверено всё, что можно проверить достоверно (валидация,
+  выбор имени пакета, отсутствие лишних повторов); сам путь
+  `uninstall + install` устроен так же, как проверенный повтор по downgrade.
+- `PackageNameSource::Auto` пока умеет только текст ошибки pm; разбор
+  `AndroidManifest.xml` (бинарный AXML) — этап 10.
+- Устройство в стенде управляется MDM и переустанавливает пакеты само (см.
+  журнал этапа 3), поэтому тесты сознательно не удаляют уже установленные
+  пакеты.
+

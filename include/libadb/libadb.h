@@ -373,11 +373,58 @@ struct ShellOptions {
     std::optional<ms> timeout;   // 0 = ждать бесконечно
 };
 
+// Что именно ставим (§10).
+enum class InstallKind {
+    // 1 apk -> Single; N apk -> SplitSet; *.apks/*.zip -> Bundle.
+    Auto = 0,
+    Single,
+    SplitSet,      // несколько частей ОДНОГО пакета (base + split_config.*)
+    Bundle,        // .apks (bundletool): распаковать и поставить как SplitSet
+    MultiPackage,  // несколько независимых пакетов в одной атомарной сессии
+};
+
+LIBADB_API const char* to_string(InstallKind);
+
+// Что делать, если пакет уже установлен и подписан другим ключом.
+enum class ConflictPolicy {
+    Fail = 0,           // (дефолт) вернуть ошибку с кодом pm
+    Reinstall,          // uninstall + install заново (данные приложения теряются)
+    ReinstallKeepData,  // ЗАРЕЗЕРВИРОВАНО: возвращает Status::NotImplemented
+};
+
+LIBADB_API const char* to_string(ConflictPolicy);
+
+// Откуда брать имя пакета, если оно нужно (для ConflictPolicy != Fail).
+enum class PackageNameSource {
+    Explicit = 0,  // (дефолт) только InstallOptions::package_name
+    Auto,          // определять автоматически (ошибка pm, затем AndroidManifest.xml)
+    Both,          // задано явно — использовать; иначе определять
+};
+
+LIBADB_API const char* to_string(PackageNameSource);
+
 struct InstallOptions {
     bool reinstall = true;             // -r
     bool allow_downgrade = false;      // -d
     bool grant_permissions = false;    // -g
     std::vector<std::string> extra_args;  // всё остальное, дословно для `pm`
+
+    // --- §10 ---
+    InstallKind kind = InstallKind::Auto;
+    ConflictPolicy on_conflict = ConflictPolicy::Fail;
+    PackageNameSource package_name_source = PackageNameSource::Explicit;
+
+    // Имя пакета: нужно для on_conflict != Fail. При Explicit и пустом значении
+    // конфликт подписи вернёт Status::InvalidArgument (переустанавливать
+    // «что-нибудь» библиотека не станет).
+    std::string package_name;
+
+    // При INSTALL_FAILED_VERSION_DOWNGRADE добавить -d и повторить один раз.
+    bool allow_downgrade_retry = false;
+
+    // Сахар над `--user N`; -1 — не указывать.
+    int user_id = -1;
+
     ProgressFn on_progress;            // прогресс заливки apk
     OutputFn on_output;                // сырой вывод pm
     StartedFn on_start;
@@ -386,6 +433,7 @@ struct InstallOptions {
 
 struct UninstallOptions {
     bool keep_data = false;  // -k
+    int user_id = -1;        // сахар над `--user N`; -1 — не указывать
     StartedFn on_start;
     std::optional<ms> timeout;
 };
@@ -550,6 +598,12 @@ class LIBADB_API Device : public std::enable_shared_from_this<Device> {
     Result shell(const std::string& command, const ShellOptions& options = {});
 
     Result install(const std::string& apk_path, const InstallOptions& options = {});
+
+    // Несколько файлов: части одного пакета (SplitSet), содержимое .apks
+    // (Bundle) или независимые пакеты одной атомарной сессией (MultiPackage).
+    // Что именно — определяет InstallOptions::kind (по умолчанию Auto, §10).
+    Result install(const std::vector<std::string>& paths, const InstallOptions& options = {});
+
     Result uninstall(const std::string& package, const UninstallOptions& options = {});
 
     // --- асинхронный режим (§9) ---
@@ -564,6 +618,8 @@ class LIBADB_API Device : public std::enable_shared_from_this<Device> {
                             const PullOptions& options = {});
     OperationPtr shell_async(const std::string& command, const ShellOptions& options = {});
     OperationPtr install_async(const std::string& apk_path, const InstallOptions& options = {});
+    OperationPtr install_async(const std::vector<std::string>& paths,
+                               const InstallOptions& options = {});
     OperationPtr uninstall_async(const std::string& package, const UninstallOptions& options = {});
 
     // Занято ли устройство асинхронной операцией прямо сейчас.

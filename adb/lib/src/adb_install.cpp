@@ -740,7 +740,7 @@ int install_multi_package(int argc, const char** argv) {
     if (first_package == -1) error_exit("need APK or APEX files on command line");
 
     if (best_install_mode() == INSTALL_PUSH) {
-        fprintf(stderr, "adb: multi-package install is not supported on this device\n");
+        report_status(stderr, "adb: multi-package install is not supported on this device\n");
         return EXIT_FAILURE;
     }
 
@@ -785,13 +785,17 @@ int install_multi_package(int argc, const char** argv) {
         }
     }
     if (parent_session_id < 0) {
-        fprintf(stderr, "adb: failed to create multi-package session\n");
-        fputs(buf, stderr);
+        report_status(stderr, "adb: failed to create multi-package session\n");
+        report_status(stderr, buf);
         return EXIT_FAILURE;
     }
     const auto parent_session_id_str = std::to_string(parent_session_id);
 
-    fprintf(stdout, "Created parent session ID %d.\n", parent_session_id);
+    // Через report_status: у библиотеки эти строки уходят в Result::output, а не
+    // в stdout приложения (прежнее поведение сохраняется, если приёмник не задан).
+    report_status(stdout,
+                  android::base::StringPrintf("Created parent session ID %d.\n", parent_session_id)
+                          .c_str());
 
     std::vector<int> session_ids;
 
@@ -849,13 +853,15 @@ int install_multi_package(int argc, const char** argv) {
             }
         }
         if (session_id < 0) {
-            fprintf(stderr, "adb: failed to create multi-package session\n");
-            fputs(buf, stderr);
+            report_status(stderr, "adb: failed to create multi-package session\n");
+            report_status(stderr, buf);
             goto finalize_multi_package_session;
         }
         const auto session_id_str = std::to_string(session_id);
 
-        fprintf(stdout, "Created child session ID %d.\n", session_id);
+        report_status(
+                stdout,
+                android::base::StringPrintf("Created child session ID %d.\n", session_id).c_str());
         session_ids.push_back(session_id);
 
         // Support splitAPKs by allowing the notation split1.apk:split2.apk:split3.apk as argument.
@@ -918,9 +924,12 @@ int install_multi_package(int argc, const char** argv) {
     }
 
     if (strncmp("Success", buf, 7)) {
-        fprintf(stderr, "adb: failed to link sessions (%s)\n",
-                android::base::Join(add_session_cmd_args, " ").c_str());
-        fputs(buf, stderr);
+        report_status(stderr,
+                      android::base::StringPrintf(
+                              "adb: failed to link sessions (%s)\n",
+                              android::base::Join(add_session_cmd_args, " ").c_str())
+                              .c_str());
+        report_status(stderr, buf);
         goto finalize_multi_package_session;
     }
 
@@ -956,13 +965,15 @@ finalize_multi_package_session:
     }
 
     if (!strncmp("Success", buf, 7)) {
-        fputs(buf, stdout);
+        // report_status, а не fputs(stdout): у библиотеки статус pm уходит в
+        // Result::output, иначе строка «Success» лезла бы в консоль приложения.
+        report_status(stdout, buf);
         if (success == 0) {
             return 0;
         }
     } else {
-        fprintf(stderr, "adb: failed to finalize session\n");
-        fputs(buf, stderr);
+        report_status(stderr, "adb: failed to finalize session\n");
+        report_status(stderr, buf);
     }
 
     session_ids.push_back(parent_session_id);
@@ -973,7 +984,9 @@ finalize_multi_package_session:
                 "install-abandon",
                 std::to_string(session_ids[i]),
         };
-        fprintf(stderr, "Attempting to abandon session ID %d\n", session_ids[i]);
+        report_status(stderr, android::base::StringPrintf("Attempting to abandon session ID %d\n",
+                                                         session_ids[i])
+                                      .c_str());
         unique_fd fd = send_command(service_args, &error);
         if (fd < 0) {
             fprintf(stderr, "adb: connect error for finalize: %s\n", error.c_str());

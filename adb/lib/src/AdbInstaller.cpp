@@ -6,50 +6,96 @@
 #include <android-base/file.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 
 extern "C" void adb_set_current_device(class AdbDevice* device);
+
+// Префикс временных каталогов распаковки .apks. По нему же ищем, что чистить.
+static const char* const kApksTempPrefix = "/tmp/libadb_apks_";
+
 std::vector<std::string> AdbInstaller::expandApks(const std::vector<std::string>& inputs) {
     std::vector<std::string> result;
     for (const auto& path : inputs) {
-        if (android::base::EndsWithIgnoreCase(path, ".apks")) {
-            // ADB не умеет ставить .apks напрямую. Распакуем во временную папку через системный unzip
-            std::string temp_dir = "/tmp/adirect_apks_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
-            mkdirs(temp_dir);
-            
-            std::string cmd = "unzip -q '" + path + "' -d '" + temp_dir + "'";
-            if (system(cmd.c_str()) != 0) {
-                std::cerr << "Failed to extract .apks file: " << path << "\n";
-                return {};
-            }
-            
-            // Собираем все .apk из распакованной папки
-            DIR* dir = opendir(temp_dir.c_str());
-            if (dir) {
-                struct dirent* entry;
-                while ((entry = readdir(dir)) != nullptr) {
-                    std::string name = entry->d_name;
-                    if (android::base::EndsWithIgnoreCase(name, ".apk")) {
-                        result.push_back(temp_dir + "/" + name);
-                    }
-                }
-                closedir(dir);
-            }
-        } else {
+        // .apks (bundletool) и обычный .zip с набором apk внутри: adb не умеет
+        // ставить их напрямую, поэтому распаковываем.
+        const bool is_bundle = android::base::EndsWithIgnoreCase(path, ".apks") ||
+                               android::base::EndsWithIgnoreCase(path, ".zip");
+        if (!is_bundle) {
             result.push_back(path);
+            continue;
+        }
+
+        std::string temp_dir = kApksTempPrefix +
+                               std::to_string(std::chrono::system_clock::now()
+                                                      .time_since_epoch()
+                                                      .count());
+        mkdirs(temp_dir);
+
+        // Вывод unzip гасим: библиотека не должна писать в консоль приложения.
+        std::string cmd = "unzip -q -o '" + path + "' -d '" + temp_dir + "' >/dev/null 2>&1";
+        if (system(cmd.c_str()) != 0) {
+            // Каталог мог остаться полупустым — убираем за собой.
+            system(("rm -rf '" + temp_dir + "'").c_str());
+            return {};
+        }
+
+        // Собираем все .apk из распакованной папки. base.apk должен идти первым:
+        // pm ожидает базовый пакет раньше своих split-частей.
+        std::vector<std::string> found;
+        std::string base;
+        DIR* dir = opendir(temp_dir.c_str());
+        if (dir) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                std::string name = entry->d_name;
+                if (!android::base::EndsWithIgnoreCase(name, ".apk")) continue;
+                if (name == "base.apk" || android::base::StartsWithIgnoreCase(name, "base-master")) {
+                    base = temp_dir + "/" + name;
+                } else {
+                    found.push_back(temp_dir + "/" + name);
+                }
+            }
+            closedir(dir);
+        }
+        std::sort(found.begin(), found.end());
+        if (!base.empty()) result.push_back(base);
+        result.insert(result.end(), found.begin(), found.end());
+
+        if (base.empty() && found.empty()) {
+            system(("rm -rf '" + temp_dir + "'").c_str());
+            return {};
         }
     }
     return result;
 }
 
-bool AdbInstaller::install(const std::vector<std::string>& paths, const std::vector<std::string>& flags) {
+void AdbInstaller::cleanupExpanded(const std::vector<std::string>& paths) {
+    // Все файлы одного бандла лежат в одном каталоге, но бандлов может быть
+    // несколько — собираем уникальные каталоги.
+    std::vector<std::string> dirs;
+    for (const auto& path : paths) {
+        if (path.find(kApksTempPrefix) != 0) continue;
+        const size_t slash = path.find_last_of('/');
+        if (slash == std::string::npos) continue;
+        std::string dir = path.substr(0, slash);
+        if (std::find(dirs.begin(), dirs.end(), dir) == dirs.end()) dirs.push_back(dir);
+    }
+    for (const auto& dir : dirs) {
+        system(("rm -rf '" + dir + "'").c_str());
+    }
+}
+
+bool AdbInstaller::install(const std::vector<std::string>& paths,
+                           const std::vector<std::string>& flags, bool multi_package) {
     auto apk_paths = expandApks(paths);
     if (apk_paths.empty()) return false;
 
-    // Формируем argv для оригинальной функции Google
+    // Формируем argv для оригинальной функции Google. argv[0] — имя команды:
+    // Google-код ожидает его на месте и пропускает при разборе.
     std::vector<const char*> argv;
-    argv.push_back("install-multiple"); // Имя команды (Google-код ожидает его в argv[0])
+    argv.push_back(multi_package ? "install-multi-package" : "install-multiple");
     for (const auto& flag : flags) {
         argv.push_back(flag.c_str());
     }
@@ -71,7 +117,10 @@ bool AdbInstaller::install(const std::vector<std::string>& paths, const std::vec
     // 3. ВЫЗЫВАЕМ ОРИГИНАЛЬНУЮ ФУНКЦИЮ GOOGLE
     // Она САМА проверит фичи (best_install_mode), сделает fallback на legacy (push),
     // обработает split-apk и все переданные флаги (-r, -t, -d, -g и т.д.)
-    int result = install_multiple_app(argv.size(), argv.data());
+    // Для независимых пакетов — своя функция: она создаёт родительскую сессию
+    // `install-create --multi-package` и вкладывает в неё по сессии на пакет.
+    int result = multi_package ? install_multi_package(argv.size(), argv.data())
+                               : install_multiple_app(argv.size(), argv.data());
 
     // 3. ВЫКЛЮЧАЕМ ПЕРЕХВАТ И ОЧИЩАЕМ СЕССИИ
     adb_set_current_device(nullptr);
@@ -81,15 +130,7 @@ bool AdbInstaller::install(const std::vector<std::string>& paths, const std::vec
     // adb_set_transport(old_type, old_serial, old_id);
 
     // 5. Очистка временных папок от распакованных .apks
-    for (const auto& path : apk_paths) {
-        size_t pos = path.find("/tmp/adirect_apks_");
-        if (pos != std::string::npos) {
-            std::string temp_dir = path.substr(0, path.find_last_of('/'));
-            std::string rm_cmd = "rm -rf '" + temp_dir + "'";
-            system(rm_cmd.c_str());
-            break; // Достаточно очистить один раз, все файлы были в одной папке
-        }
-    }
+    cleanupExpanded(apk_paths);
 
     return result == 0;
 }
