@@ -1,0 +1,10 @@
+libadb (1.0.0-1) unstable; urgency=medium
+
+  * Initial packaging of libadb 1.0.
+  * libadb1: shared library (libadb.so.1).
+  * libadb-dev: headers, pkg-config file and CMake package configuration.
+  * BoringSSL and libziparchive are linked statically and their symbols are
+    hidden by the version script, so the packages do not ship or depend on
+    them.
+
+ -- libadb maintainers <libadb@example.com>  Tue, 11 Aug 2026 12:00:00 +0300

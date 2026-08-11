@@ -1,0 +1,54 @@
+# libbsd-dev в Build-Depends нужен из-за strlcpy: в glibc он появился только в
+# 2.38 (Ubuntu 24.04+), а на Debian 12 (glibc 2.36) берётся из libbsd. На
+# системах с новой glibc пакет просто не используется, поэтому он указан
+# безусловно — так один control работает на всех целевых дистрибутивах.
+Source: libadb
+Section: libs
+Priority: optional
+Maintainer: libadb maintainers <libadb@example.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake (>= 3.25),
+               g++ (>= 12),
+               git,
+               pkg-config,
+               libprotobuf-dev,
+               protobuf-compiler,
+               libbrotli-dev,
+               liblz4-dev,
+               libzstd-dev,
+               libspdlog-dev,
+               libfmt-dev,
+               zlib1g-dev,
+               libbsd-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://android.googlesource.com/platform/packages/modules/adb
+
+Package: libadb1
+Architecture: any
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Direct control of Android devices over TCP
+ libadb lets an application talk to Android devices directly over TCP
+ (push, pull, shell, install, uninstall) without starting the adb server
+ and without shelling out to the adb binary.
+ .
+ Features: synchronous and asynchronous operations, machine readable events,
+ transfer statistics, per phase timeouts with a commit health check,
+ cancellation, a global connection limit and split/.apks/multi-package installs.
+ .
+ This package contains the shared library.
+
+Package: libadb-dev
+Section: libdevel
+Architecture: any
+Multi-Arch: same
+Depends: libadb1 (= ${binary:Version}), ${misc:Depends}
+Description: Direct control of Android devices over TCP (development files)
+ libadb lets an application talk to Android devices directly over TCP
+ (push, pull, shell, install, uninstall) without starting the adb server
+ and without shelling out to the adb binary.
+ .
+ This package contains the headers, the pkg-config file and the CMake package
+ configuration needed to build against libadb. The public headers only include
+ standard C++ library headers, so no other development package is required.

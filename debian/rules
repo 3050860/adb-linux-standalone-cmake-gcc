@@ -1,0 +1,61 @@
+#!/usr/bin/make -f
+#
+# Сборка deb-пакетов libadb1 / libadb-dev (этап 13, часть 3 плана).
+#
+# BoringSSL берётся из локального кеша third_party/boringssl-src, если он есть:
+# debhelper собирает в свежем obj-<arch>/, поэтому иначе ~500 МБ клонировались бы
+# заново при каждой сборке пакета, требуя сети. Подготовить кеш один раз:
+#   bash scripts/fetch-boringssl.sh
+# Без кеша сборка тоже пройдёт, но потребует доступ к сети (в sbuild — флаг
+# --enable-network).
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Подробный вывод: dh печатает каждую вызываемую команду, а cmake/make — каждую
+# строку компиляции. Иначе `make packages` показывает лишь молчание на минуты,
+# и непонятно, идёт ли сборка и на чём она встала.
+export DH_VERBOSE = 1
+export VERBOSE = 1
+
+# Только библиотека: консольные adb/adirect в пакеты не входят.
+CMAKE_EXTRA = -DLIBADB_INSTALL_TOOLS=OFF
+
+# Кеш исходников BoringSSL. Приоритет:
+#   1) переменная окружения BORINGSSL_SOURCE_DIR (так его передаёт сборка в
+#      контейнере: `make packages` монтирует кеш в /boringssl-src);
+#   2) кеш в дереве исходников (обычная сборка на хосте).
+# Если ни того, ни другого нет — CMake склонирует BoringSSL сам, но тогда
+# сборке потребуется доступ к сети.
+ifeq ($(origin BORINGSSL_SOURCE_DIR), undefined)
+BORINGSSL_SOURCE_DIR := $(CURDIR)/third_party/boringssl-src
+endif
+
+ifneq ($(wildcard $(BORINGSSL_SOURCE_DIR)/CMakeLists.txt),)
+CMAKE_EXTRA += -DBORINGSSL_SOURCE_DIR=$(BORINGSSL_SOURCE_DIR)
+$(info libadb: using pre-cloned BoringSSL from $(BORINGSSL_SOURCE_DIR))
+else
+$(warning libadb: no BoringSSL cache at $(BORINGSSL_SOURCE_DIR) — it will be cloned from the network)
+endif
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- $(CMAKE_EXTRA)
+
+# Собираем только цель библиотеки: adb и adirect пакету не нужны, а их сборка
+# заметно дольше.
+override_dh_auto_build:
+	dh_auto_build -- adb_shared
+
+# Тесты требуют живых Android-устройств в сети, поэтому в сборке пакета их нет.
+override_dh_auto_test:
+
+# .so собран с -fvisibility=hidden и version script; символы внутренних
+# статических зависимостей наружу не видны, dpkg-shlibdeps их и не увидит.
+#
+# --no-scripts НЕ используем: без него теряется триггер ldconfig, и lintian
+# справедливо ругается lacks-ldconfig-trigger — после установки пакета кеш
+# ld.so не обновится, и приложение может не найти libadb.so.1.
+override_dh_makeshlibs:
+	dh_makeshlibs -V

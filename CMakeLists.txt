@@ -12,16 +12,68 @@ include(ExternalProject)
 # Поставить такое в /usr/lib значит рисковать сломать сторонний софт, а держать
 # рядом с приложением — тянуть RUNPATH и путаться с загрузчиком.
 # -fPIC обязателен: статические объекты попадают внутрь libadb.so.
-ExternalProject_Add(boringssl
-    GIT_REPOSITORY "https://github.com/google/boringssl.git"
-    GIT_TAG "0.20251002.0"
-    SOURCE_DIR "${PROJECT_BINARY_DIR}/external/boringssl"
-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl
-               -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-               -DBUILD_SHARED_LIBS=0
-    BUILD_BYPRODUCTS ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
-                     ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
+set(BORINGSSL_GIT_TAG "0.20251002.0" CACHE STRING "BoringSSL tag to build")
+
+# Готовое дерево исходников BoringSSL. Если задано, git не вызывается вообще:
+# сборка становится offline и не тратит минуты на клон 500+ МБ репозитория при
+# каждой пересборке (в частности, при сборке deb-пакетов — см. debian/rules).
+# Подготовить кеш: bash scripts/fetch-boringssl.sh
+set(BORINGSSL_SOURCE_DIR "" CACHE PATH
+    "Pre-cloned BoringSSL source tree; empty = clone from git during build")
+
+if (BORINGSSL_SOURCE_DIR AND NOT EXISTS "${BORINGSSL_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "BORINGSSL_SOURCE_DIR=${BORINGSSL_SOURCE_DIR} does not look like a "
+        "BoringSSL checkout (no CMakeLists.txt). Run scripts/fetch-boringssl.sh")
+endif()
+
+# Общие аргументы для обеих ветвей (кеш / клон).
+#
+# BUILD_TESTING=OFF — самое важное для времени сборки: иначе BoringSSL собирает
+# свои тесты (pki_test, bssl_shim, handshaker, gtest), а это минуты на каждый
+# дистрибутив в `make packages`. Нам нужны только libssl.a и libcrypto.a.
+# Тесты BoringSSL гоняет upstream; наша задача — слинковать библиотеку.
+set(BORINGSSL_CMAKE_ARGS
+    -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    -DBUILD_SHARED_LIBS=0
+    -DBUILD_TESTING=OFF
+    # Некоторые версии gcc (Debian 12: gcc-12, Debian 13: gcc-13) считают
+    # maybe-uninitialized в jitter.cc ошибкой из-за -Werror в самом BoringSSL.
+    # CMAKE_CXX_FLAGS_INIT устанавливается до того, как BoringSSL добавляет свои
+    # флаги, и не может быть перезаписан — в отличие от CMAKE_CXX_FLAGS.
+    -DCMAKE_CXX_FLAGS_INIT=-Wno-maybe-uninitialized
+    -DCMAKE_C_FLAGS_INIT=-Wno-maybe-uninitialized
 )
+set(BORINGSSL_BYPRODUCTS
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
+)
+
+if (BORINGSSL_SOURCE_DIR)
+    message(STATUS "BoringSSL: using pre-cloned source ${BORINGSSL_SOURCE_DIR}")
+    # DOWNLOAD_COMMAND "" полностью отключает шаг загрузки; SOURCE_DIR при этом
+    # используется как есть и не модифицируется (сборка out-of-source), поэтому
+    # каталог можно монтировать read-only.
+    ExternalProject_Add(boringssl
+        SOURCE_DIR "${BORINGSSL_SOURCE_DIR}"
+        DOWNLOAD_COMMAND ""
+        UPDATE_COMMAND ""
+        CMAKE_ARGS ${BORINGSSL_CMAKE_ARGS}
+        BUILD_BYPRODUCTS ${BORINGSSL_BYPRODUCTS}
+    )
+else()
+    message(STATUS "BoringSSL: cloning ${BORINGSSL_GIT_TAG} during build "
+                   "(set BORINGSSL_SOURCE_DIR to build offline)")
+    ExternalProject_Add(boringssl
+        GIT_REPOSITORY "https://github.com/google/boringssl.git"
+        GIT_TAG "${BORINGSSL_GIT_TAG}"
+        GIT_SHALLOW TRUE
+        SOURCE_DIR "${PROJECT_BINARY_DIR}/external/boringssl"
+        CMAKE_ARGS ${BORINGSSL_CMAKE_ARGS}
+        BUILD_BYPRODUCTS ${BORINGSSL_BYPRODUCTS}
+    )
+endif()
 set(BORINGSSL_INCLUDE_DIRS ${PROJECT_BINARY_DIR}/lib/boringssl/include)
 set(BORINGSSL_LIBRARIES
     ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
@@ -32,12 +84,28 @@ include(CheckFunctionExists)
 find_package(PkgConfig)
 check_function_exists(strlcpy HAVE_STRLCPY)
 
+# strlcpy появился в glibc только с версии 2.38 (Ubuntu 24.04+). На Debian 12
+# (glibc 2.36) и других системах постарше его нет, и функция берётся из libbsd.
+#
+# REQUIRED здесь стоять НЕ должен: с ним pkg_check_modules прерывает
+# конфигурацию своим сообщением («A required package was not found»), ветка
+# else() становится мёртвым кодом, и вместо внятного объяснения пользователь
+# видит стек вызовов внутри FindPkgConfig.cmake.
 if (NOT HAVE_STRLCPY)
-    pkg_check_modules(LIBBSD REQUIRED libbsd)
+    pkg_check_modules(LIBBSD libbsd)
     if (LIBBSD_FOUND)
+        message(STATUS "strlcpy: taken from libbsd ${LIBBSD_VERSION}")
         set(NEED_LIBBSD TRUE)
+        # pkg_check_modules отдаёт в LIBBSD_LIBRARIES голое имя ("bsd") без -L.
+        # В стандартном пути линковщик его найдёт, но если libbsd лежит в другом
+        # префиксе — нет. Добавляем каталоги поиска явно.
+        link_directories(${LIBBSD_LIBRARY_DIRS})
     else()
-        message(WARNING "strlcpy not found in standard library, and libbsd is not available. You may need to install libbsd-dev.")
+        message(FATAL_ERROR
+            "strlcpy отсутствует в libc этой системы (glibc < 2.38), а libbsd не найдена.\n"
+            "Установите пакет разработки libbsd:\n"
+            "    Debian/Ubuntu: apt-get install libbsd-dev\n"
+            "Проверить наличие: pkg-config --modversion libbsd")
     endif()
 endif()
 
@@ -216,7 +284,7 @@ target_include_directories(adirect PRIVATE
 )
 target_link_libraries(adirect PRIVATE
     ${BORINGSSL_LIBRARIES}
-    diagnose_usb crypto ssl crypto_utils build cutils log ziparchive
+    diagnose_usb crypto_utils build cutils log ziparchive
     ${Protobuf_LIBRARIES}
     ${BROTLI_LIBRARIES}
     ${LZ4_LIBRARIES}
@@ -297,7 +365,7 @@ add_subdirectory(system/core/libutils utils)
 
 target_link_libraries(adb PRIVATE
     ${BORINGSSL_LIBRARIES}
-    diagnose_usb crypto ssl crypto_utils build cutils log ziparchive
+    diagnose_usb crypto_utils build cutils log ziparchive
 #    ${LIBUSB_LIBRARIES}
     ${Protobuf_LIBRARIES}
     ${BROTLI_LIBRARIES}
@@ -402,7 +470,7 @@ target_include_directories(adb_core PUBLIC
 )
 target_link_libraries(adb_core PUBLIC
     ${BORINGSSL_LIBRARIES}
-    diagnose_usb crypto ssl crypto_utils build cutils log ziparchive
+    diagnose_usb crypto_utils build cutils log ziparchive
     ${Protobuf_LIBRARIES}
     ${BROTLI_LIBRARIES}
     ${LZ4_LIBRARIES}
@@ -518,4 +586,10 @@ configure_file(${CMAKE_SOURCE_DIR}/adb/lib/libadb.pc.in ${CMAKE_BINARY_DIR}/liba
 install(FILES ${CMAKE_BINARY_DIR}/libadb.pc
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
+
+# Примеры: собираются только при явном запросе (не ломают сборку библиотеки).
+option(BUILD_EXAMPLES "Build examples in examples/" OFF)
+if (BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
 
