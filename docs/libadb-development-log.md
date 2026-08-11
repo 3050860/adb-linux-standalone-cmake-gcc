@@ -957,3 +957,110 @@ PASSED; `adirect` собирается, `shell` и `push` на живом уст
 Регрессии: `test_011`…`test_017` — ALL PASSED; `adirect` собирается и работает
 (он идёт по прежнему пути `adb_auth_init()`, поведение не изменилось).
 
+## Этап 11 — упаковка: установка, pkg-config, CMake export (§13.4)
+
+**Что сделано**
+
+- `adb/lib/libadb.pc.in` → `libadb.pc`: `Libs: -L${libdir} -ladb`,
+  `Cflags: -I${includedir}`, без единой внутренней зависимости.
+- `adb/lib/libadbConfig.cmake.in` + `configure_package_config_file` и
+  `write_basic_package_version_file` (`COMPATIBILITY SameMajorVersion` — ровно
+  обещание §13.5: совместимость внутри одного MAJOR).
+- `install()` для `adb_shared`, заголовков `include/libadb/*` и
+  сгенерированного `version.h`, `install(EXPORT ... NAMESPACE libadb::)`.
+- `target_include_directories(adb_shared PUBLIC ...)` с
+  `BUILD_INTERFACE`/`INSTALL_INTERFACE`: в дереве сборки два каталога заголовков,
+  после установки — один.
+- `option(LIBADB_INSTALL_TOOLS)`: deb-пакеты библиотеки не должны тащить
+  консольные `adb`/`adirect`.
+
+**Принятые решения и грабли**
+
+1. **`set(CMAKE_INSTALL_PREFIX /opt)` был жёстким** и молча перебивал
+   `-DCMAKE_INSTALL_PREFIX=/usr`, то есть упаковать в deb было невозможно в
+   принципе. Теперь значение по умолчанию ставится только если пользователь
+   ничего не задал (`CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT`).
+2. **`EXPORT_NAME adb`.** Внутренний таргет называется `adb_shared`, поэтому в
+   экспорт уезжал `libadb::adb_shared`, а документированная строка
+   `target_link_libraries(app libadb::adb)` не работала — тест это поймал.
+   Добавлен ещё и `add_library(libadb::adb ALIAS adb_shared)`, чтобы примеры
+   подключались одинаково и из дерева, и из пакета.
+3. **`pkg-config --cflags` для префикса `/usr` пустой — и это правильно.**
+   pkg-config опускает `-I/usr/include` как путь поиска по умолчанию. Для
+   проверки staging-каталога нужен `PKG_CONFIG_SYSROOT_DIR`; сначала я принял
+   это за дефект `.pc`, поэтому в тесте теперь проверяется именно поведение с
+   sysroot (заодно подтверждая, что `includedir` собран из `${prefix}`, а не
+   зашит).
+4. **`version.h.in` не должен попасть в пакет** — `install(DIRECTORY)` с
+   `FILES_MATCHING PATTERN "*.h"` его отбрасывает; проверяется тестом.
+
+**Что проверено (`test/auto/test_019_packaging.cpp` + драйвер
+`test/auto/run_test_019.sh`, 26 проверок, ALL PASSED)**
+
+Тест намеренно написан «от потребителя»: собирается и работает **только** против
+staging-каталога, без `-I`/`-L` на дерево исходников. Именно так и вылезли
+дефекты 1–2 и настоящая проблема с зависимостями (см. этап 12).
+
+- заголовки, `.so` и симлинки версий на месте, `version.h.in` — нет;
+- SONAME внутри файла — `libadb.so.1`;
+- `pkg-config --modversion/--libs/--cflags` отдают ожидаемое, `--libs` не тянет
+  BoringSSL;
+- `libadbConfig/ConfigVersion/Targets.cmake` установлены, экспортирован
+  `libadb::adb`, путей из дерева сборки в экспорте нет;
+- наружу 106 символов, символов BoringSSL/ziparchive и `libadb::internal` — 0;
+- потребитель собирается и работает **через pkg-config** и **через
+  `find_package(libadb 1.0 REQUIRED)` + `libadb::adb`**;
+- `find_package(libadb 2.0)` корректно отвергается (`SameMajorVersion`).
+
+## Этап 12 (часть 2) — статическая линковка BoringSSL и libziparchive
+
+**Что сделано**
+
+- BoringSSL: `BUILD_SHARED_LIBS=0`, `CMAKE_POSITION_INDEPENDENT_CODE=ON`,
+  `BUILD_BYPRODUCTS` на `libssl.a`/`libcrypto.a`; `BORINGSSL_LIBRARIES` теперь
+  указывает на `.a`.
+- `system/libziparchive`: `SHARED` → `STATIC` + `POSITION_INDEPENDENT_CODE ON`.
+- Убрана установка `libssl.so`/`libcrypto.so`/`libziparchive.so` рядом с `adb`:
+  этих файлов больше не существует.
+- `add_dependencies(crypto_utils boringssl)`.
+- `find_package(ZLIB REQUIRED)` + `ZLIB::ZLIB` в `PUBLIC` для `ziparchive`.
+
+**Результат (то, ради чего всё делалось)**
+
+`readelf -d libadb.so.1.0.0`: из `NEEDED` **исчезли** `libssl.so`,
+`libcrypto.so`, `libziparchive.so`, а вместе с ними и `RUNPATH`, который раньше
+указывал в дерево сборки (`.../build/lib/boringssl/lib:.../build/ziparchive`) —
+то есть установленная библиотека работала только пока рядом лежал исходный код.
+Осталось 12 честных дистрибутивных зависимостей (protobuf, brotli, lz4, zstd,
+spdlog, fmt, zlib, libstdc++, libm, libgcc_s, libc, ld-linux).
+
+Размер `libadb.so.1.0.0`: 16.7 МБ → 41.4 МБ (Debug-сборка с отладочной
+информацией). Символов наружу — 106, из них BoringSSL/ziparchive/`android::base`
+— **ноль**: version script и `--exclude-libs,ALL` работают как задумано, поэтому
+приложение спокойно линкует свой OpenSSL рядом.
+
+**Грабли**
+
+1. **Гонка на чистой сборке.** `crypto_utils/android_pubkey.cpp` использует
+   `BN_le2bn`/`BN_bn2le_padded`, которых нет в системном OpenSSL, и
+   компилировался раньше, чем `ExternalProject` разложит заголовки BoringSSL.
+   Пока BoringSSL был предсобран, это не проявлялось; после полной пересборки
+   вылезло сразу. Лечится `add_dependencies(crypto_utils boringssl)`.
+2. **zlib пришлось указать явно.** У разделяемой `libziparchive.so` zlib был
+   собственной зависимостью и подтягивался неявно; у статической библиотеки
+   зависимостей нет, поэтому `adb` и `adirect` перестали линковаться
+   («undefined reference to `inflateEnd`… DSO missing from command line»).
+   Теперь `ziparchive` линкует `ZLIB::ZLIB` как `PUBLIC`.
+3. **Три оставшихся неопределённых символа — норма.** `OPENSSL_memory_alloc/
+   free/get_size` помечены `w` (weak): это опциональные хуки аллокатора
+   BoringSSL, определение им не требуется.
+
+**Что проверено**
+
+- `test_011`…`test_018` — ALL PASSED (8 функциональных тестов на живых
+  устройствах 192.168.177.249 и .248);
+- `test_019` (упаковка) — ALL PASSED, включая сборку потребителя из
+  staging-каталога;
+- `adirect shell` на живом устройстве работает; в `readelf -d adirect` ни одной
+  ссылки на удалённые `.so`.
+

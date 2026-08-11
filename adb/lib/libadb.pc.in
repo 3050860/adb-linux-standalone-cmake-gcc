@@ -1,0 +1,16 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libadb
+Description: Direct control of Android devices over TCP (push/pull/shell/install) without the adb server
+Version: @PROJECT_VERSION@
+
+# Только сама библиотека: всё остальное (BoringSSL, libziparchive, base, cutils)
+# слинковано внутрь и наружу не видно — см. version script adb/lib/libadb.map.
+Libs: -L${libdir} -ladb
+
+# Публичные заголовки не тянут ни одной внутренней зависимости: только STL,
+# поэтому Cflags ограничивается путём к include.
+Cflags: -I${includedir}

@@ -5,16 +5,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 project(ADB VERSION 1.0.0)
 
 include(ExternalProject)
+# BoringSSL собираем ТОЛЬКО статически (этап 12, часть 2 плана).
+#
+# Разделяемый вариант непригоден для распространения: SONAME у него — ровно
+# libssl.so / libcrypto.so, то есть те же имена, что у системного OpenSSL.
+# Поставить такое в /usr/lib значит рисковать сломать сторонний софт, а держать
+# рядом с приложением — тянуть RUNPATH и путаться с загрузчиком.
+# -fPIC обязателен: статические объекты попадают внутрь libadb.so.
 ExternalProject_Add(boringssl
     GIT_REPOSITORY "https://github.com/google/boringssl.git"
     GIT_TAG "0.20251002.0"
     SOURCE_DIR "${PROJECT_BINARY_DIR}/external/boringssl"
-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl -DCMAKE_CXX_FLAGS="-fPIC" -DBUILD_SHARED_LIBS=1 -DBUILD_STATIC_LIBS=1
+    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${PROJECT_BINARY_DIR}/lib/boringssl
+               -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+               -DBUILD_SHARED_LIBS=0
+    BUILD_BYPRODUCTS ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
+                     ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
 )
 set(BORINGSSL_INCLUDE_DIRS ${PROJECT_BINARY_DIR}/lib/boringssl/include)
 set(BORINGSSL_LIBRARIES
-    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.so
-    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.so
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libssl.a
+    ${PROJECT_BINARY_DIR}/lib/boringssl/lib/libcrypto.a
 )
 
 include(CheckFunctionExists)
@@ -314,19 +325,29 @@ target_include_directories(ziparchive PUBLIC
 )
 
 
-# Инсталляция adb
-set(CMAKE_INSTALL_PREFIX /opt)
+# Инсталляция adb.
+#
+# Префикс по умолчанию — /opt (историческое поведение этого проекта: adb и его
+# .so ставились в /opt/adb). Но жёсткий set() ломал бы упаковку в deb, где
+# префикс обязан быть /usr, поэтому уважаем значение, заданное извне
+# (-DCMAKE_INSTALL_PREFIX=... или CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT).
+if (CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX /opt CACHE PATH "install prefix" FORCE)
+endif()
+
+# Консольные утилиты ставим только когда это явно попросили: deb-пакеты
+# libadb1/libadb-dev содержат исключительно библиотеку и заголовки.
+option(LIBADB_INSTALL_TOOLS "Install the adb/adirect command line tools" ON)
+
+if (LIBADB_INSTALL_TOOLS)
 install(TARGETS adb
     RUNTIME DESTINATION adb
 )
+endif()
 
-# Установка динамических библиотек
-install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/lib/boringssl/lib/libssl.so
-    ${CMAKE_CURRENT_BINARY_DIR}/lib/boringssl/lib/libcrypto.so
-    ${CMAKE_CURRENT_BINARY_DIR}/ziparchive/libziparchive.so
-    DESTINATION adb/lib
-)
+# Установки libssl.so/libcrypto.so/libziparchive.so больше нет: после этапа 12
+# все три линкуются статически внутрь adb и libadb.so, отдельных файлов не
+# существует. Это же убрало необходимость в rpath на каталог adb/lib.
 
 # Настройка RPATH для автоматического поиска библиотек
 set_target_properties(adb PROPERTIES
@@ -425,5 +446,76 @@ target_link_options(adb_shared PRIVATE
 )
 set_target_properties(adb_shared PROPERTIES
     LINK_DEPENDS ${CMAKE_SOURCE_DIR}/adb/lib/libadb.map
+)
+
+# ---------------------------------------------------------------------------
+# Установка libadb: заголовки, .so, pkg-config, CMake-конфиг (этап 11)
+#
+# Потребителю доступны два способа подключения:
+#   pkg-config --cflags --libs libadb
+#   find_package(libadb 1.0 REQUIRED) + target_link_libraries(app libadb::adb)
+# ---------------------------------------------------------------------------
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# Пути к заголовкам разные для сборки и для установки: в дереве исходников их
+# два каталога (include/ и сгенерированный build/include/), после установки —
+# один ${CMAKE_INSTALL_INCLUDEDIR}.
+target_include_directories(adb_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+# EXPORT_NAME: внутренний таргет называется adb_shared, но потребителю обещан
+# libadb::adb (§13.4). Без этого экспортировался бы libadb::adb_shared, и
+# документированная строка target_link_libraries(app libadb::adb) не работала бы.
+set_target_properties(adb_shared PROPERTIES EXPORT_NAME adb)
+
+# Тот же псевдоним внутри дерева сборки: примеры и тесты подключаются строкой
+# libadb::adb независимо от того, установлена библиотека или нет.
+add_library(libadb::adb ALIAS adb_shared)
+
+install(TARGETS adb_shared
+    EXPORT libadbTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+# Публичные заголовки: рукописные из include/libadb и сгенерированный version.h.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/libadb
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+)
+install(FILES ${CMAKE_BINARY_DIR}/include/libadb/version.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/libadb
+)
+
+install(EXPORT libadbTargets
+    FILE libadbTargets.cmake
+    NAMESPACE libadb::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libadb
+)
+
+configure_package_config_file(
+    ${CMAKE_SOURCE_DIR}/adb/lib/libadbConfig.cmake.in
+    ${CMAKE_BINARY_DIR}/libadbConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libadb
+)
+# SameMajorVersion: C++ API совместим внутри одного MAJOR (см. §13.5).
+write_basic_package_version_file(
+    ${CMAKE_BINARY_DIR}/libadbConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    ${CMAKE_BINARY_DIR}/libadbConfig.cmake
+    ${CMAKE_BINARY_DIR}/libadbConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libadb
+)
+
+configure_file(${CMAKE_SOURCE_DIR}/adb/lib/libadb.pc.in ${CMAKE_BINARY_DIR}/libadb.pc @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/libadb.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
 
