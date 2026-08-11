@@ -1,0 +1,5 @@
+add_example(ex_push    push.cpp)
+add_example(ex_shell   shell.cpp)
+add_example(ex_install install.cpp)
+add_example(ex_events  events.cpp)
+add_example(ex_async   async.cpp)
