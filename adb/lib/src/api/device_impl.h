@@ -22,11 +22,16 @@
 
 namespace libadb::internal {
 
+class OperationContext;
+
 // Куда складывать вывод текущей операции. Устанавливается на время shell/install
 // и снимается по завершении: listener живёт дольше отдельной операции.
 struct OutputTarget {
     std::string* buffer = nullptr;  // nullptr, если capture_output == false
     const OutputFn* callback = nullptr;
+    // Операция, от имени которой публикуются события OperationOutput (§8).
+    // nullptr — вывод в события не транслируется.
+    OperationContext* op = nullptr;
 };
 
 // Слушатель событий одного устройства. Все методы вызываются из потоков adb
@@ -78,7 +83,9 @@ class LIBADB_INTERNAL FacadeListener : public IDeviceListener {
 namespace libadb {
 
 // Определение PIMPL-части Device: нужно и device.cpp, и client.cpp (тот создаёт объекты).
-struct Device::Impl {
+// LIBADB_INTERNAL: имена Device::Impl подпадают под шаблон _ZN6libadb* в
+// libadb.map, поэтому видимость гасим явно — методы PIMPL наружу не нужны.
+struct LIBADB_INTERNAL Device::Impl {
     std::string address;  // как его передал вызывающий, для сообщений и ключей результата
     std::string serial;   // "ip:port" — то, чем оперирует внутренний adb
     std::shared_ptr<AdbDevice> device;
@@ -95,6 +102,11 @@ struct Device::Impl {
     // Закрывает подключение и отпускает транспорт (idempotent).
     void close();
 
+    // Выполняет shell-команду. op != nullptr — события публикуются от имени
+    // уже начатой операции (например, uninstall, который работает через shell
+    // и не должен создавать вторую операцию).
+    Result run_shell(const std::string& command, const ShellOptions& options,
+                     internal::OperationContext* op);
 };
 
 namespace internal {

@@ -400,6 +400,7 @@ set(LIBADB_API_SOURCES
     adb/lib/src/api/status.cpp
     adb/lib/src/api/device_address.cpp
     adb/lib/src/api/log.cpp
+    adb/lib/src/api/events.cpp
     adb/lib/src/api/device.cpp
     adb/lib/src/api/client.cpp
 )

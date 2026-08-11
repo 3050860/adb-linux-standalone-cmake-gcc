@@ -9,6 +9,7 @@
 
 #include "AdbManager.h"
 #include "api/device_impl.h"
+#include "api/events.h"
 
 namespace libadb {
 namespace {
@@ -58,9 +59,15 @@ class SlotPool {
         const auto has_room = [this] { return limit_ == 0 || active_ < limit_; };
 
         if (!has_room()) {
-            if (timeout <= ms::zero()) return Status::SlotBusy;
+            if (timeout <= ms::zero()) {
+                internal::publish_device_event(EventType::SlotTimeout, serial, Status::SlotBusy,
+                                               "no free connection slot");
+                return Status::SlotBusy;
+            }
 
             internal::emit_log(LogLevel::Debug, serial, "waiting for a connection slot");
+            internal::publish_device_event(EventType::SlotWaiting, serial, Status::Ok,
+                                           "waiting for a connection slot");
             bool acquired;
             if (timeout == ms::max()) {
                 // wait_for(ms::max()) переполняет внутренние вычисления времени,
@@ -70,10 +77,16 @@ class SlotPool {
             } else {
                 acquired = cv_.wait_for(lock, timeout, has_room);
             }
-            if (!acquired) return Status::SlotTimeout;
+            if (!acquired) {
+                internal::publish_device_event(EventType::SlotTimeout, serial, Status::SlotTimeout,
+                                               "timed out waiting for a connection slot");
+                return Status::SlotTimeout;
+            }
         }
 
         ++active_;
+        internal::publish_device_event(EventType::SlotAcquired, serial, Status::Ok,
+                                       "connection slot acquired");
         return Status::Ok;
     }
 
@@ -168,6 +181,12 @@ Status Client::initialize(const Options& options) {
     libadb::set_log_options(options.log);
     libadb::set_log_sink(options.log_sink);
 
+    // События (§8): настройки шины и базовая подписка из Options.
+    auto& bus = internal::EventBus::instance();
+    bus.set_queue_limit(options.event_queue_limit);
+    bus.set_progress_interval(options.progress_interval);
+    bus.set_primary_subscription(options.on_event, options.event_mask);
+
     auto& manager = AdbManager::instance();
     manager.setMaxThreads(options.max_parallel);
     impl_->slots.set_limit(options.max_connections);
@@ -243,12 +262,15 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
 
 
     internal::emit_log(LogLevel::Debug, serial, "connecting");
+    internal::publish_device_event(EventType::DeviceConnecting, serial, Status::Ok, "connecting");
     impl->device = AdbManager::instance().connectDevice(serial, impl->listener.get());
     if (!impl->device) {
         // Транспорт не создан — освобождать через disconnectDevice() нечего.
         impl->closed = true;
         set_status(Status::ConnectFailed);
         internal::emit_log(LogLevel::Error, serial, "failed to initiate connection");
+        internal::publish_device_event(EventType::DeviceLost, serial, Status::ConnectFailed,
+                                       "failed to initiate connection");
         return nullptr;
     }
 
@@ -257,6 +279,13 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
         set_status(wait_status);
         internal::emit_log(LogLevel::Error, serial,
                            std::string("connect failed: ") + to_string(wait_status));
+        // AuthRequired — отдельное событие: причина отказа не «сломалось», а
+        // «нажмите OK на устройстве».
+        internal::publish_device_event(wait_status == Status::AuthRequired
+                                               ? EventType::DeviceAuthRequired
+                                               : EventType::DeviceLost,
+                                       serial, wait_status,
+                                       std::string("connect failed: ") + to_string(wait_status));
         impl->close();  // отпускаем транспорт, иначе он останется висеть в adb
         return nullptr;
     }
@@ -264,6 +293,8 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
     // Серийник мог уточниться при рукопожатии.
     impl->serial = impl->listener->serial();
     internal::emit_log(LogLevel::Info, impl->serial, "connected");
+    internal::publish_device_event(EventType::DeviceConnected, impl->serial, Status::Ok,
+                                   "connected");
 
     DevicePtr device = internal::DeviceFactory::create(std::move(impl));
     impl_->remember(device);
@@ -392,6 +423,26 @@ size_t Client::active_connections() const {
     return impl_->slots.active();
 }
 
+SubscriptionId Client::subscribe(EventFn handler, EventMask mask) {
+    return internal::EventBus::instance().subscribe(std::move(handler), mask);
+}
+
+void Client::unsubscribe(SubscriptionId id) {
+    internal::EventBus::instance().unsubscribe(id);
+}
+
+void Client::set_progress_interval(ms interval) {
+    {
+        std::unique_lock<std::shared_mutex> lock(impl_->mutex);
+        impl_->options.progress_interval = interval;
+    }
+    internal::EventBus::instance().set_progress_interval(interval);
+}
+
+ms Client::progress_interval() const {
+    return internal::EventBus::instance().progress_interval();
+}
+
 void Client::set_log_options(const LogOptions& options) {
 
     {
@@ -429,6 +480,11 @@ void Client::shutdown() {
         impl_->initialized = false;
     }
     internal::emit_log(LogLevel::Debug, "", "shutting down");
+    internal::publish_device_event(EventType::ClientShutdown, "", Status::Ok, "client shutdown");
+    // Досылаем всё, что уже в очереди, и только потом останавливаем шину:
+    // подписчик должен увидеть ClientShutdown.
+    internal::EventBus::instance().drain();
+    internal::EventBus::instance().stop();
     AdbManager::instance().stop();
     libadb::flush_log();
 }

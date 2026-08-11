@@ -194,6 +194,10 @@ using ProgressFn =
 using OutputFn =
     std::function<void(const std::string& serial, std::string_view chunk, bool is_stderr)>;
 
+// Вызывается ДО начала работы операции и отдаёт её идентификатор: позволяет
+// отменить синхронный вызов из другого потока (§9).
+using StartedFn = std::function<void(OperationId id, const std::string& serial)>;
+
 // ---------------------------------------------------------------------------
 // Результат операции
 // ---------------------------------------------------------------------------
@@ -225,6 +229,70 @@ struct Result {
 };
 
 // ---------------------------------------------------------------------------
+// События (§8)
+// ---------------------------------------------------------------------------
+
+// ВНИМАНИЕ: порядок значений — часть ABI (по нему строится EventMask).
+// Новые типы добавлять только в конец.
+enum class EventType {
+    DeviceConnecting = 0,
+    DeviceConnected,
+    DeviceAuthRequired,
+    DeviceUnauthorized,
+    DeviceDisconnected,
+    DeviceLost,
+
+    SlotWaiting,
+    SlotAcquired,
+    SlotTimeout,
+
+    OperationStarted,
+    OperationPhaseChanged,
+    OperationProgress,
+    OperationHeartbeat,
+    OperationRetry,
+    OperationOutput,
+    OperationFinished,
+    OperationTimeout,
+    OperationCanceled,
+    OperationFailed,
+    OperationStats,
+
+    ClientShutdown,
+    InternalError,
+};
+
+LIBADB_API const char* to_string(EventType);
+
+struct Event {
+    EventType type = EventType::InternalError;
+    ms timestamp{0};        // монотонное время от инициализации клиента
+    std::string serial;     // "" для событий уровня клиента
+    OperationId op = 0;     // 0, если событие не относится к операции
+    Command command = Command::Connect;
+    Phase phase = Phase::None;
+    Status status = Status::Ok;
+    std::string remote_code;
+    uint64_t bytes_done = 0;
+    uint64_t bytes_total = 0;
+    ms elapsed{0};
+    std::string message;
+    TransferStats stats;    // заполняется для OperationStats/OperationFinished
+};
+
+using EventFn = std::function<void(const Event&)>;
+using SubscriptionId = uint64_t;
+
+// Битовая маска по EventType: бит N соответствует значению N.
+// ~EventMask{0} — все события.
+using EventMask = uint64_t;
+
+// Маска из перечисления: event_bit(EventType::OperationProgress) и т.п.
+constexpr EventMask event_bit(EventType type) {
+    return EventMask{1} << static_cast<unsigned>(type);
+}
+
+// ---------------------------------------------------------------------------
 // Опции отдельных операций
 // ---------------------------------------------------------------------------
 
@@ -232,16 +300,19 @@ struct PushOptions {
     Compression compression = Compression::Any;
     bool sync_only_newer = false;  // как `adb push --sync`: пропускать совпадающие файлы
     ProgressFn on_progress;
+    StartedFn on_start;            // получить OperationId до начала работы
 };
 
 struct PullOptions {
     Compression compression = Compression::None;
     ProgressFn on_progress;
+    StartedFn on_start;
 };
 
 struct ShellOptions {
     bool capture_output = true;  // складывать вывод в Result::output
     OutputFn on_output;          // и/или отдавать его потоком
+    StartedFn on_start;
 };
 
 struct InstallOptions {
@@ -250,10 +321,13 @@ struct InstallOptions {
     bool grant_permissions = false;    // -g
     std::vector<std::string> extra_args;  // всё остальное, дословно для `pm`
     ProgressFn on_progress;            // прогресс заливки apk
+    OutputFn on_output;                // сырой вывод pm
+    StartedFn on_start;
 };
 
 struct UninstallOptions {
     bool keep_data = false;  // -k
+    StartedFn on_start;
 };
 
 // ---------------------------------------------------------------------------
@@ -279,6 +353,23 @@ struct Options {
     // 0 — не ждать вовсе (сразу Status::SlotBusy),
     // ms::max() — ждать бесконечно, иначе — Status::SlotTimeout по истечении.
     ms slot_acquire{30000};
+
+    // --- события (§8) ---
+
+    // Базовый подписчик: то же, что Client::subscribe(on_event, event_mask),
+    // только задаётся сразу в initialize(). Повторный initialize() заменяет
+    // именно эту подписку, не затрагивая добавленных через subscribe().
+    EventFn on_event;
+    EventMask event_mask = ~EventMask{0};
+
+    // Минимальный интервал между OperationProgress одной операции.
+    // 0 — не троттлить (все события прогресса доставляются).
+    ms progress_interval{200};
+
+    // Ограничение очереди диспетчера. При переполнении первыми выбрасываются
+    // OperationProgress/OperationHeartbeat, а о потерях приходит InternalError
+    // с их количеством. Критичные события не теряются.
+    size_t event_queue_limit = 10000;
 };
 
 
@@ -395,6 +486,20 @@ class LIBADB_API Client {
 
     // Сколько слотов занято прямо сейчас (открытые подключения).
     size_t active_connections() const;
+
+    // --- события (§8) ---
+
+    // Подписка на события. Обработчик вызывается из диспетчер-потока
+    // библиотеки (не из потока adb и не из потока операции), поэтому его можно
+    // писать без оглядки на реентерабельность протокола — но блокировать
+    // надолго нельзя: события копятся в очереди.
+    // Возвращает идентификатор для unsubscribe(); 0 — sink не задан.
+    SubscriptionId subscribe(EventFn handler, EventMask mask = ~EventMask{0});
+    void unsubscribe(SubscriptionId id);
+
+    // Троттлинг OperationProgress в рантайме (0 — не троттлить).
+    void set_progress_interval(ms interval);
+    ms progress_interval() const;
 
     // Логирование: то же, что свободные функции, но через клиент.
     void set_log_options(const LogOptions& options);

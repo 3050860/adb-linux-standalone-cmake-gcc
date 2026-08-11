@@ -14,6 +14,7 @@
 #include "adb_utils.h"
 
 #include "api/device_impl.h"
+#include "api/events.h"
 
 namespace libadb {
 namespace {
@@ -89,36 +90,59 @@ Result device_lost_result(Command command) {
 namespace internal {
 
 void FacadeListener::onConnectionStateChanged(const std::string& serial, ConnectionState state) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!serial.empty()) serial_ = serial;
+    // Событие публикуем после освобождения мьютекса: обработчик подписчика
+    // не должен исполняться под нашим локом (он вызывается из потока adb).
+    EventType event_type = EventType::InternalError;
+    Status event_status = Status::Ok;
+    const char* event_message = nullptr;
 
-    switch (state) {
-        case kCsDevice:
-            online_ = true;
-            auth_required_ = false;
-            break;
-        case kCsUnauthorized:
-            auth_required_ = true;
-            break;
-        case kCsNoPerm:
-            failed_ = true;
-            if (error_.empty()) error_ = "insufficient permissions to talk to the device";
-            break;
-        case kCsOffline:
-        case kCsDetached:
-            // Offline приходит и в начале подключения (до ответа устройства),
-            // поэтому «упало» считаем только если устройство уже было в сети.
-            if (online_) {
-                online_ = false;
+    std::string current_serial;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!serial.empty()) serial_ = serial;
+        current_serial = serial_;
+
+        switch (state) {
+            case kCsDevice:
+                online_ = true;
+                auth_required_ = false;
+                break;
+            case kCsUnauthorized:
+                auth_required_ = true;
+                event_type = EventType::DeviceUnauthorized;
+                event_status = Status::Unauthorized;
+                event_message = "device is unauthorized";
+                break;
+            case kCsNoPerm:
                 failed_ = true;
-                if (error_.empty()) error_ = "device went offline";
-            }
-            break;
+                if (error_.empty()) error_ = "insufficient permissions to talk to the device";
+                event_type = EventType::DeviceLost;
+                event_status = Status::ConnectFailed;
+                event_message = "insufficient permissions to talk to the device";
+                break;
+            case kCsOffline:
+            case kCsDetached:
+                // Offline приходит и в начале подключения (до ответа устройства),
+                // поэтому «упало» считаем только если устройство уже было в сети.
+                if (online_) {
+                    online_ = false;
+                    failed_ = true;
+                    if (error_.empty()) error_ = "device went offline";
+                    event_type = EventType::DeviceLost;
+                    event_status = Status::DeviceLost;
+                    event_message = "device went offline";
+                }
+                break;
 
-        default:
-            break;
+            default:
+                break;
+        }
+        cv_.notify_all();
     }
-    cv_.notify_all();
+
+    if (event_message) {
+        publish_device_event(event_type, current_serial, event_status, event_message);
+    }
 }
 
 void FacadeListener::onAuthRequired(const std::string& /*serial*/) {
@@ -128,6 +152,8 @@ void FacadeListener::onAuthRequired(const std::string& /*serial*/) {
     }
     cv_.notify_all();
     emit_log(LogLevel::Warn, serial(), "authorization required: accept the RSA key on the device");
+    publish_device_event(EventType::DeviceAuthRequired, serial(), Status::AuthRequired,
+                         "authorization required: accept the RSA key on the device");
 }
 
 void FacadeListener::onShellData(const std::string& /*serial*/, uint32_t /*session_id*/,
@@ -137,6 +163,9 @@ void FacadeListener::onShellData(const std::string& /*serial*/, uint32_t /*sessi
     if (output_.callback && *output_.callback) {
         (*output_.callback)(serial_, std::string_view(data, len), is_stderr);
     }
+    // Событие OperationOutput: сам Event уходит в очередь, поэтому подписчик
+    // не тормозит reader-поток сессии.
+    if (output_.op) output_.op->output(std::string_view(data, len), is_stderr);
 }
 
 void FacadeListener::onSessionClosed(const std::string& /*serial*/, uint32_t /*session_id*/,
@@ -152,6 +181,7 @@ void FacadeListener::onError(const std::string& /*serial*/, const std::string& e
     }
     cv_.notify_all();
     emit_log(LogLevel::Error, serial(), error_msg);
+    publish_device_event(EventType::InternalError, serial(), Status::Internal, error_msg);
 }
 
 Status FacadeListener::wait_until_online(ms timeout) {
@@ -232,6 +262,8 @@ void Device::Impl::close() {
             AdbManager::instance().disconnectDevice(serial);
         }
         internal::emit_log(LogLevel::Debug, serial, "disconnected");
+        internal::publish_device_event(EventType::DeviceDisconnected, serial, Status::Ok,
+                                       "disconnected");
     }
 
     // Слот отдаём последним и вне проверки closed: при неудачном подключении
@@ -272,7 +304,16 @@ void Device::close() {
 Result Device::push(const std::string& local, const std::string& remote,
                     const PushOptions& options) {
     const auto started = clock_type::now();
-    if (!is_online()) return device_lost_result(Command::Push);
+    // Контекст создаём до любых проверок: вызывающий получает OperationId даже
+    // у операции, которая тут же и провалилась.
+    internal::OperationContext op(Command::Push, impl_->serial);
+    op.start(options.on_start);
+
+    if (!is_online()) {
+        Result result = device_lost_result(Command::Push);
+        op.finish(result);
+        return result;
+    }
 
     const uint64_t size = file_size(local);
     if (size == 0 && !android::base::EndsWith(local, "/")) {
@@ -283,6 +324,7 @@ Result Device::push(const std::string& local, const std::string& remote,
             result.status = Status::LocalFileError;
             result.error = "cannot read local file: " + local;
             result.duration = elapsed_since(started);
+            op.finish(result);
             return result;
         }
     }
@@ -290,6 +332,7 @@ Result Device::push(const std::string& local, const std::string& remote,
     internal::emit_log(LogLevel::Info, impl_->serial, "push " + local + " -> " + remote);
 
     AdbFileSync sync(impl_->device);
+    op.set_phase(Phase::Transfer);
     const auto transfer_started = clock_type::now();
     // quiet = true: прогресс-бар SyncConnection пишет в stdout и ломал бы вывод
     // приложения, у которого много устройств одновременно.
@@ -302,22 +345,35 @@ Result Device::push(const std::string& local, const std::string& remote,
     result.duration = elapsed_since(started);
     if (ok) {
         fill_transfer_stats(result, size, transfer_duration);
+        // Промежуточного прогресса от SyncConnection пока нет (этап 6), поэтому
+        // отдаём хотя бы завершающее событие «передано столько-то».
+        op.progress(size, size, true);
+        if (options.on_progress) options.on_progress(impl_->serial, size, size);
     } else {
         result.status = Status::IoError;
         result.error = impl_->listener->take_error();
         if (result.error.empty()) result.error = "push failed";
     }
+    op.finish(result);
     return result;
 }
 
 Result Device::pull(const std::string& remote, const std::string& local,
                     const PullOptions& options) {
     const auto started = clock_type::now();
-    if (!is_online()) return device_lost_result(Command::Pull);
+    internal::OperationContext op(Command::Pull, impl_->serial);
+    op.start(options.on_start);
+
+    if (!is_online()) {
+        Result result = device_lost_result(Command::Pull);
+        op.finish(result);
+        return result;
+    }
 
     internal::emit_log(LogLevel::Info, impl_->serial, "pull " + remote + " -> " + local);
 
     AdbFileSync sync(impl_->device);
+    op.set_phase(Phase::Transfer);
     const auto transfer_started = clock_type::now();
     const bool ok = sync.pull({remote}, local, false,
                               internal::to_compression_type(options.compression), true);
@@ -328,28 +384,33 @@ Result Device::pull(const std::string& remote, const std::string& local,
     result.duration = elapsed_since(started);
     if (ok) {
         // Размер известен только после скачивания — берём с локальной копии.
-        fill_transfer_stats(result, file_size(local), transfer_duration);
+        const uint64_t size = file_size(local);
+        fill_transfer_stats(result, size, transfer_duration);
+        op.progress(size, size, true);
+        if (options.on_progress) options.on_progress(impl_->serial, size, size);
     } else {
         result.status = Status::IoError;
         result.error = impl_->listener->take_error();
         if (result.error.empty()) result.error = "pull failed";
     }
+    op.finish(result);
     return result;
 }
 
-Result Device::shell(const std::string& command, const ShellOptions& options) {
+Result Device::Impl::run_shell(const std::string& command, const ShellOptions& options,
+                               internal::OperationContext* op) {
     const auto started = clock_type::now();
-    if (!is_online()) return device_lost_result(Command::Shell);
 
     Result result;
     internal::OutputTarget target;
     if (options.capture_output) target.buffer = &result.output;
     if (options.on_output) target.callback = &options.on_output;
-    impl_->listener->set_output_target(target);
+    target.op = op;
+    listener->set_output_target(target);
 
-    auto session = impl_->device->createShellSession(command);
+    auto session = device->createShellSession(command);
     if (!session || !session->start()) {
-        impl_->listener->clear_output_target();
+        listener->clear_output_target();
         result.status = Status::Internal;
         result.error = "failed to start shell session";
         result.duration = elapsed_since(started);
@@ -357,7 +418,7 @@ Result Device::shell(const std::string& command, const ShellOptions& options) {
     }
 
     result.exit_code = session->wait();
-    impl_->listener->clear_output_target();
+    listener->clear_output_target();
 
     result.phase = Phase::Finalize;
     result.duration = elapsed_since(started);
@@ -366,15 +427,42 @@ Result Device::shell(const std::string& command, const ShellOptions& options) {
     return result;
 }
 
+Result Device::shell(const std::string& command, const ShellOptions& options) {
+    internal::OperationContext op(Command::Shell, impl_->serial);
+    op.start(options.on_start);
+
+    if (!is_online()) {
+        Result result = device_lost_result(Command::Shell);
+        op.finish(result);
+        return result;
+    }
+
+    op.set_phase(Phase::Transfer);
+    Result result = impl_->run_shell(command, options, &op);
+    op.set_phase(result.phase);
+    op.finish(result);
+    return result;
+}
+
 Result Device::install(const std::string& apk_path, const InstallOptions& options) {
     const auto started = clock_type::now();
-    if (!is_online()) return device_lost_result(Command::Install);
+    internal::OperationContext op(Command::Install, impl_->serial);
+    op.start(options.on_start);
 
+    if (!is_online()) {
+        Result result = device_lost_result(Command::Install);
+        op.finish(result);
+        return result;
+    }
+
+    op.set_phase(Phase::Prepare);
     if (file_size(apk_path) == 0) {
         Result result;
         result.status = Status::LocalFileError;
+        result.phase = Phase::Prepare;
         result.error = "apk not found or empty: " + apk_path;
         result.duration = elapsed_since(started);
+        op.finish(result);
         return result;
     }
 
@@ -389,9 +477,14 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     // вытащить причину отказа (INSTALL_FAILED_*).
     internal::OutputTarget target;
     target.buffer = &result.output;
+    if (options.on_output) target.callback = &options.on_output;
+    target.op = &op;
     impl_->listener->set_output_target(target);
 
     internal::emit_log(LogLevel::Info, impl_->serial, "install " + apk_path);
+    // Разделение фаз install по таймаутам — этап 7; сейчас событиями отмечаем
+    // только переход к заливке и коммиту, чтобы подписчик видел прогресс работ.
+    op.set_phase(Phase::Transfer);
     // Статусные строки pm ("Success"/"Failure [...]") приходят не через shell-канал,
     // а из кода установки, который печатал их в stdout процесса. Перенаправляем их
     // в result.output: библиотека не должна писать в консоль приложения.
@@ -404,9 +497,14 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     impl_->device->clearActiveSessions();
 
     result.duration = elapsed_since(started);
-    fill_transfer_stats(result, file_size(apk_path), result.duration);
+    const uint64_t apk_size = file_size(apk_path);
+    fill_transfer_stats(result, apk_size, result.duration);
     if (ok) {
         result.phase = Phase::Finalize;
+        op.set_phase(Phase::Finalize);
+        op.progress(apk_size, apk_size, true);
+        if (options.on_progress) options.on_progress(impl_->serial, apk_size, apk_size);
+        op.finish(result);
         return result;
     }
 
@@ -417,13 +515,22 @@ Result Device::install(const std::string& apk_path, const InstallOptions& option
     result.remote_code = parse_failure_code(result.output);
     result.status = Status::RemoteError;
     result.error = result.remote_code.empty() ? "install failed" : result.remote_code;
+    op.set_phase(Phase::Commit);
+    op.finish(result);
     return result;
 
 }
 
 Result Device::uninstall(const std::string& package, const UninstallOptions& options) {
     const auto started = clock_type::now();
-    if (!is_online()) return device_lost_result(Command::Uninstall);
+    internal::OperationContext op(Command::Uninstall, impl_->serial);
+    op.start(options.on_start);
+
+    if (!is_online()) {
+        Result result = device_lost_result(Command::Uninstall);
+        op.finish(result);
+        return result;
+    }
 
     // Удаление выполняем через обычный shell-канал: путь uninstall_app() из
     // кода adb опирается на send_shell_command(), которая в этой сборке
@@ -442,12 +549,17 @@ Result Device::uninstall(const std::string& package, const UninstallOptions& opt
 
     ShellOptions shell_options;
     shell_options.capture_output = true;
-    Result result = shell(command, shell_options);
+    // Через run_shell(), а не через shell(): вторая операция с собственным
+    // OperationId здесь была бы лишней — событие уже одно, uninstall.
+    op.set_phase(Phase::Transfer);
+    Result result = impl_->run_shell(command, shell_options, &op);
     result.duration = elapsed_since(started);
     result.phase = Phase::Finalize;
+    op.set_phase(Phase::Finalize);
     if (!result.ok()) {
         // Ошибка самого канала (устройство отвалилось и т.п.) — отдаём как есть.
         if (result.error.empty()) result.error = "uninstall failed";
+        op.finish(result);
         return result;
     }
 
@@ -464,6 +576,7 @@ Result Device::uninstall(const std::string& package, const UninstallOptions& opt
                            ? "uninstall failed: " + android::base::Trim(result.output)
                            : result.remote_code;
     }
+    op.finish(result);
     return result;
 }
 
@@ -471,7 +584,10 @@ Result Device::uninstall(const std::string& package, const UninstallOptions& opt
 std::optional<std::string> Device::get_prop(const std::string& name) {
     ShellOptions options;
     options.capture_output = true;
-    Result result = shell("getprop " + name, options);
+    // Служебный вызов: отдельной операции и событий не заводим, иначе каждый
+    // getprop засорял бы поток событий приложения.
+    if (!is_online()) return std::nullopt;
+    Result result = impl_->run_shell("getprop " + name, options, nullptr);
     if (!result.ok()) return std::nullopt;
 
     std::string value = android::base::Trim(result.output);

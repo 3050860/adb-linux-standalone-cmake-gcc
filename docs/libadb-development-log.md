@@ -316,3 +316,106 @@ namespace `libadb` (`_ZN6libadb*`, `_ZNK6libadb*`, `_ZTIN/_ZTSN/_ZTVN6libadb*`),
 Регрессии: `test_011` — ALL PASSED, `adirect -f ... shell` на двух устройствах
 работает как прежде.
 
+## Этап 5 — события без статистики (§8)
+
+**Что сделано**
+
+Публичный API (`include/libadb/libadb.h`):
+
+- `EventType` (23 значения), `Event`, `EventFn`, `SubscriptionId`, `EventMask`,
+  `constexpr event_bit(EventType)`, `to_string(EventType)`.
+- `StartedFn` и поле `on_start` во всех `*Options`: идентификатор операции
+  выдаётся **до** начала работы — на этапе 8 по нему можно будет отменить
+  синхронный вызов из другого потока.
+- `InstallOptions::on_output` (сырой вывод `pm`), как в §10.
+- `Options`: `on_event`, `event_mask`, `progress_interval` (200 мс),
+  `event_queue_limit` (10 000).
+- `Client::subscribe/unsubscribe`, `set_progress_interval/progress_interval`.
+
+Реализация: `adb/lib/src/api/events.h` + `events.cpp` (новый файл в
+`LIBADB_API_SOURCES`).
+
+- `EventBus` — синглтон в куче (как `Client`): очередь `std::deque<Event>`,
+  один диспетчер-поток, список подписчиков с индивидуальными масками.
+- `OperationContext` — контекст одной операции: `OperationId`, команда, фаза,
+  `start/set_phase/progress/heartbeat/output/retry/finish`. Тип финального
+  события выбирается по `Result::status`: `Ok` → `OperationFinished`,
+  `Canceled`/`ConnectionClosed` → `OperationCanceled`, таймауты →
+  `OperationTimeout`, остальное → `OperationFailed`. Плюс `OperationStats`,
+  если что-то реально передавалось (статистика по-настоящему появится на
+  этапе 6, здесь она берётся из уже существующего `Result::transfer`).
+- `ProgressThrottle` — троттлинг `OperationProgress` по
+  `Options::progress_interval`; первое и последнее (`force`) события проходят
+  всегда, иначе при быстрой передаче не увидеть ни одного.
+- События устройств: `DeviceConnecting/Connected/AuthRequired/Unauthorized/
+  Disconnected/Lost` из `Client::connect()`, `FacadeListener` и
+  `Device::Impl::close()`; `SlotWaiting/SlotAcquired/SlotTimeout` из `SlotPool`;
+  `ClientShutdown` из `Client::shutdown()`; `InternalError` из
+  `FacadeListener::onError()`.
+
+**Принятые решения и грабли**
+
+1. **`wants(type)` без лока.** Объединённая маска всех подписчиков лежит в
+   `std::atomic<EventMask>` и пересчитывается при под/отписке. Смысл: если
+   событие никому не нужно, `publish()` не берёт мьютекс и не форматирует
+   строки — а `OperationOutput` иначе копировал бы каждый чанк вывода.
+2. **Диспетчер поднимается лениво**, в первом `subscribe()`. Без подписчиков
+   лишнего потока в процессе нет.
+3. **Переполнение очереди.** Сначала выбрасывается самое старое «расходное»
+   событие (`OperationProgress`/`OperationHeartbeat`); если очередь целиком из
+   критичных, а пришло расходное — выбрасывается оно само; если критичное —
+   жертвуем самым старым, но не теряем новое. О потерях приходит
+   `InternalError` с их количеством, и **только когда очередь разгрузилась**,
+   иначе сообщение о переполнении само же переполняет очередь.
+4. **Копия списка подписчиков** перед вызовом обработчиков: обработчик вправе
+   позвать `subscribe()`/`unsubscribe()` прямо из колбэка.
+5. **Исключение из обработчика** ловится (`std::exception` и `...`) и
+   превращается в `InternalError` — иначе один плохой подписчик убивал бы
+   диспетчер вместе с доставкой всем остальным.
+6. **`unsubscribe()` уничтожает `EventFn` вне мьютекса**: деструктор захваченных
+   объектов может позвать наши же методы.
+7. **`OperationOutput`**: признак `stderr` уложен в `Event::bytes_done` (0/1).
+   Отдельное поле означало бы расширение публичной структуры, то есть ломку ABI;
+   когда понадобится по-настоящему — только с ростом `SOVERSION`.
+8. **События из `FacadeListener::onConnectionStateChanged()`** публикуются
+   после освобождения мьютекса слушателя: метод вызывается из fdevent-потока
+   adb, и держать чужой обработчик под своим локом нельзя.
+9. **`uninstall` и `get_prop` не создают вторую операцию.** Оба работали через
+   публичный `Device::shell()`, из-за чего появлялся лишний `OperationId` с
+   `Command::Shell`. Появился `Device::Impl::run_shell(command, options, op)`:
+   `uninstall` передаёт свой контекст, `get_prop` — `nullptr` (служебный вызов
+   в поток событий приложения не попадает вовсе).
+10. **`Device::Impl` помечен `LIBADB_INTERNAL`.** Его методы подпадали под
+    шаблон `_ZN6libadb*` из `libadb.map` и уезжали в динамическую таблицу
+    `.so` (было 4 таких символа ещё до этапа, теперь 0).
+11. **`shutdown()` сначала `drain()`, потом `stop()`**: подписчик обязан
+    увидеть `ClientShutdown`, а не потерять его вместе с остановкой шины.
+
+**Что проверено (`test/auto/test_013_events.cpp`, 33 проверки, ALL PASSED на
+192.168.177.249)**
+
+- подписка из `Options` работает; события приходят **не** из потока приложения;
+- `DeviceConnecting`/`DeviceConnected` с непустым `serial`;
+- `on_start` отдаёт `OperationId` и `serial`; **все** события операции несут
+  этот же id; первое — `OperationStarted`, последнее — `OperationFinished`;
+- `OperationOutput` доставляет текст, напечатанный командой;
+- маска `event_bit(OperationFinished)` пропускает только это событие, а
+  подписчик без маски продолжает получать всё;
+- `unsubscribe()` прекращает доставку (0 событий после отписки);
+- `progress_interval` читается из `Options` и меняется в рантайме;
+- проваленный `push` даёт `OperationFailed` с тем же `Status` и `Command`;
+- успешный `push` даёт `OperationProgress`, `OperationPhaseChanged` и
+  `OperationStats` с `stats.bytes == Result::transfer.bytes`;
+- `close()` → `DeviceDisconnected`, `shutdown()` → `ClientShutdown`.
+
+Регрессии: `test_011` и `test_012` — ALL PASSED, `adirect` собирается.
+
+**Что осталось**
+
+- Промежуточного прогресса передачи пока нет: `SyncConnection` не отдаёт
+  колбэк, поэтому `OperationProgress` приходит один раз, по завершении
+  (`force`). Настоящий поток прогресса и `bytes_on_wire` — этап 6.
+- `OperationHeartbeat` и `OperationRetry` реализованы в `OperationContext`, но
+  ещё никем не публикуются: heartbeat нужен health-check'у коммита (этап 7),
+  retry — `ConflictPolicy` (этап 9).
+
