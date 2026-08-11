@@ -1041,24 +1041,132 @@ virtual-метода, изменение inline-функции в заголов
 
 ## 15. План работ (этап = коммит `libadb-phase-N`)
 
+План разбит на четыре части. Нумерация этапов сквозная и **не** совпадает с
+первоначальной редакцией документа: порядок пересмотрен по итогам этапов 0–9.
+Перед каждым коммитом — запись в `docs/libadb-development-log.md`.
+
+### Часть 1. Библиотека версии 1.0
+
+| Этап | Содержание | Статус |
+|---|---|---|
+| 0 | Этот документ + `docs/libadb-development-log.md` | готово |
+| 1 | Сборка: `adb_core` (STATIC, PIC), `libadb.so` (visibility hidden, version script, SOVERSION), `version.h.in`, каркас публичных заголовков. `adirect` не меняется | готово |
+| 2 | Фасад `Client`/`Device` (PIMPL) + синхронные `push/pull/shell/install/uninstall` поверх существующих внутренних классов | готово |
+| 3 | Логирование: `LogOptions` (включая «выключено = файл не открываем»), `LogSink`, `spdlog_sink.hpp` | готово |
+| 4 | Слоты подключений: `max_connections`, `slot_acquire`, оба режима работы (батч и одиночный `connect`) | готово |
+| 5 | События: диспетчер-поток, подписки, маски, троттлинг прогресса — **без статистики** | готово |
+| 6 | Статистика: `TransferStats`, `OperationStats`, скорость МБ/с в `Result` и событиях | готово |
+| 7 | Таймауты: `total`/`stall` для передачи, фазы `install`, health-check коммита (`Transport`/`Shell`) | готово |
+| 8 | Отмена и асинхронный режим: `Operation`, `BatchOperation`, отдельный async-пул, `cancel/cancel_all/close_all` | готово |
+| 9 | Установка: split/`.apks`/multi-package, разбор ошибок `pm`, `ConflictPolicy` (`ReinstallKeepData` → `NotImplemented`) | готово |
+| 10 | Авторизация: ключи из файлов и из текста PEM (`AuthOptions`) — **был этапом 12** | |
+| 11 | Упаковка: `libadb.map`, `libadb.pc.in`, CMake export, установка, `abidiff` — **был этапом 14** | |
+| 14 | Документация по реализованному публичному API библиотеки (`docs/libadb-usage.md`): всё, что вошло в 1.0, включая особенности health-check и суммирование пулов подключений — **был этапом 15** | |
+
+Этапы 12 и 13 — это части 2 и 3 соответственно (см. ниже). Нумерация выбрана
+так, чтобы этап 14 (документация по API) закрывал версию 1.0 последним — уже
+после того, как решены вопросы со сборкой зависимостей и упаковкой.
+
+### Часть 2. Зависимости: статическая линковка вместо своих `.so` (этап 12)
+
+**Решение принято: линкуем статически, своих `.so` в систему не ставим.**
+Рассматривался вариант «переименовать BoringSSL в `bssl`, собрать deb-пакет и
+поставить в систему» — он отвергнут, причины ниже.
+
+Что сейчас (замер на собранной библиотеке):
+
+```
+readelf -d build/libadb.so.1 | grep NEEDED
+  libssl.so          <- BoringSSL, SONAME без версии
+  libcrypto.so       <- BoringSSL, SONAME без версии
+  libziparchive.so   <- вообще без SONAME
+  libprotobuf.so.32, libbrotli*, liblz4, libzstd, libspdlog, libfmt  <- дистрибутивные
+```
+
+Почему статика, а не свой пакет:
+
+1. **Конфликт имён с системным OpenSSL.** У BoringSSL SONAME — ровно
+   `libssl.so` и `libcrypto.so`, то есть те же имена, что у OpenSSL. Свой пакет
+   с такими файлами — риск сломать сторонний софт в системе. Переименование в
+   `bssl` проблему решает, но требует патчить сборку BoringSSL и тащить пакет
+   через apt на трёх дистрибутивах.
+2. **`libziparchive.so` собран без SONAME** — как разделяемая библиотека он для
+   установки в систему непригоден в принципе.
+3. **Ни BoringSSL, ни libziparchive не имеют стабильного ABI** и не
+   версионируются: обновление любой из них ломало бы всех потребителей.
+4. **Утечки символов не будет.** У `libadb.so` уже стоят `-fvisibility=hidden`,
+   version script `adb/lib/libadb.map` (наружу только `libadb_*` и
+   `_ZN6libadb*`) и `-Wl,--exclude-libs,ALL`. Символы статических зависимостей
+   попадут внутрь `.so`, но в динамическую таблицу — нет, то есть приложение
+   спокойно линкует свой OpenSSL рядом.
+
+Работы этапа 12:
+
+- BoringSSL собирать статически (`libssl.a`, `libcrypto.a`, обязательно
+  `-fPIC`; `BUILD_STATIC_LIBS=1` в `ExternalProject_Add` уже есть) и линковать в
+  `libadb.so`.
+- `system/libziparchive/CMakeLists.txt`: `add_library(ziparchive SHARED ...)` →
+  `STATIC` + `POSITION_INDEPENDENT_CODE ON`, линковать в `libadb.so`.
+- Проверить, что `libcutils`, `libbase`, `diagnose_usb`, `crypto_utils`,
+  `libbuildversion` тоже статические и с `-fPIC` (сейчас так и есть).
+- Убедиться, что `adirect` продолжает собираться и работать: он линкуется из тех
+  же статических объектов.
+- Контроль результата: в `readelf -d libadb.so.1` из `NEEDED` исчезают
+  `libssl.so`, `libcrypto.so`, `libziparchive.so`; `nm -D --defined-only` не
+  показывает ни одного символа BoringSSL/ziparchive; размер `.so` вырастет —
+  зафиксировать в журнале.
+- Дистрибутивные зависимости (protobuf, brotli, lz4, zstd, spdlog, fmt)
+  остаются динамическими: они есть в apt и версионируются нормально.
+
+### Часть 3. Пакеты, документация, примеры (этап 13)
+
+Инфраструктура сборки deb-пакетов и всё, что нужно потребителю библиотеки.
+
+**Два пакета:**
+
+- `libadb1` — рантайм: `libadb.so.1`, `libadb.so.1.0.0`;
+- `libadb-dev` — заголовки (`include/libadb/*.h` и сгенерированный
+  `version.h`), симлинк `libadb.so`, `libadb.pc` для pkg-config, CMake-конфиг
+  для `find_package(libadb)`.
+
+**pkg-config** — используем: `libadb.pc.in` уже предусмотрен этапом 11, в
+`libadb-dev` файл ставится в `/usr/lib/x86_64-linux-gnu/pkgconfig/`.
+
+**Инфраструктура сборки:** каталог `debian/` (`control`, `rules`, `changelog`,
+`debhelper-compat`, `libadb1.install`, `libadb-dev.install`, `libadb1.symbols`
+или `shlibs`), сборка через `dpkg-buildpackage`. Целевые дистрибутивы —
+**Debian 12, Ubuntu 24.04, Ubuntu 26.04**; сборка под каждый в контейнере или
+chroot, скрипт сборки положить в репозиторий.
+
+**Зависимости в `control`.** Имена версионированных пакетов между
+дистрибутивами различаются (например, `libprotobuf32t64` и `libspdlog1.12` в
+Ubuntu 24.04 против других имён в Debian 12), поэтому в `Depends` пишем
+`${shlibs:Depends}, ${misc:Depends}` — `dpkg-shlibdeps` подставит правильные
+имена на каждом дистрибутиве сам. В `Build-Depends` `-dev`-пакеты перечисляем
+явно. После части 2 BoringSSL и ziparchive в зависимости не попадают вовсе.
+
+**Проверка пакетов:** `lintian`; установка в чистый контейнер каждого из трёх
+дистрибутивов; сборка и запуск примера **только** против установленного пакета,
+без дерева исходников.
+
+**Документация по использованию** — `docs/libadb-usage.md` расширяется до
+полного руководства: установка пакета, подключение через pkg-config и CMake, все
+сценарии (синхронный и асинхронный режимы, события, таймауты, отмена, установка
+split/`.apks`/multi-package, логирование, лимит подключений).
+
+**Примеры в `examples/`:** на C++ и на C (полноценный C-пример — после
+появления C ABI, часть 4), плюс `adirect2` как аналог `adirect` на публичном
+API. Сборка CMake, работа и из установленного пакета, и без установки
+(rpath `$ORIGIN`).
+
+### Часть 4. Библиотека версии 1.1
+
 | Этап | Содержание |
 |---|---|
-| 0 | Этот документ + `docs/libadb-development-log.md` |
-| 1 | Сборка: `adb_core` (STATIC, PIC), `libadb.so` (visibility hidden, version script, SOVERSION), `version.h.in`, каркас публичных заголовков. `adirect` не меняется |
-| 2 | Фасад `Client`/`Device` (PIMPL) + синхронные `push/pull/shell/install/uninstall` поверх существующих внутренних классов |
-| 3 | Логирование: `LogOptions` (включая «выключено = файл не открываем»), `LogSink`, `spdlog_sink.hpp` |
-| 4 | Слоты подключений: `max_connections`, `slot_acquire`, оба режима работы (батч и одиночный `connect`) |
-| 5 | События: диспетчер-поток, подписки, маски, троттлинг прогресса — **без статистики** |
-| 6 | Статистика: `TransferStats`, `OperationStats`, скорость МБ/с в `Result` и событиях |
-| 7 | Таймауты: `total`/`stall` для передачи, фазы `install`, health-check коммита (`Transport`/`Shell`) |
-| 8 | Отмена и асинхронный режим: `Operation`, `BatchOperation`, отдельный async-пул, `cancel/cancel_all/close_all` |
-| 9 | Установка: split/`.apks`/multi-package, разбор ошибок `pm`, `ConflictPolicy` (`ReinstallKeepData` → `NotImplemented`) |
-| 10 | Парсер `AndroidManifest.xml` (AXML) → авто-определение `package_name`, `PackageNameSource` |
-| 11 | `ShellSession` (`logcat`), снятие ограничения «одна сессия на устройство» |
-| 12 | Авторизация: ключи из файлов и из текста PEM (`AuthOptions`) |
-| 13 | C ABI: `libadb_c.h` + реализация |
-| 14 | Упаковка: `libadb.map`, `libadb.pc.in`, CMake export, установка, `abidiff` |
-| 15 | Руководство `docs/libadb-usage.md` (включая описание особенностей health-check и суммирования пулов подключений) |
-| 16 | `examples/`: примеры на C++ и C, `adirect2`; сборка CMake без установки в систему, инструкция |
+| 15 | Парсер `AndroidManifest.xml` (AXML) → авто-определение `package_name`, `PackageNameSource::Auto`/`Both` — **был этапом 10** |
+| 16 | C ABI: `libadb_c.h` + реализация — **был этапом 13** |
+| 17 | `ShellSession` (`logcat`), снятие ограничения «одна сессия на устройство» — **был этапом 11** |
 
-Перед каждым коммитом — запись в `docs/libadb-development-log.md`.
+Все три этапа только добавляют символы, поэтому `SOVERSION` не меняется:
+`libadb.so.1` остаётся, растёт MINOR (1.1.0). Появление C ABI и `ShellSession`
+потребует расширить version script (`libadb.map`) новым узлом `LIBADB_1.1`.
