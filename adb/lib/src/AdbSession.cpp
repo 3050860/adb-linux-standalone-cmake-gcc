@@ -147,15 +147,15 @@ void AdbSession::readerThread() {
         ShellProtocol protocol(local_fd_.get());
         while (protocol.Read()) {
             if (protocol.id() == ShellProtocol::kIdStdout) {
-                if (device_->listener_) {
-                    device_->listener_->onShellData(device_->getSerial(), session_id_, 
-                                                    protocol.data(), protocol.data_length(), false);
-                }
+                const std::string serial = device_->getSerial();
+                device_->withListener([&](IDeviceListener& l) {
+                    l.onShellData(serial, session_id_, protocol.data(), protocol.data_length(), false);
+                });
             } else if (protocol.id() == ShellProtocol::kIdStderr) {
-                if (device_->listener_) {
-                    device_->listener_->onShellData(device_->getSerial(), session_id_, 
-                                                    protocol.data(), protocol.data_length(), true);
-                }
+                const std::string serial = device_->getSerial();
+                device_->withListener([&](IDeviceListener& l) {
+                    l.onShellData(serial, session_id_, protocol.data(), protocol.data_length(), true);
+                });
             } else if (protocol.id() == ShellProtocol::kIdExit) {
                 exit_code = static_cast<uint8_t>(protocol.data()[0]);
             }
@@ -166,15 +166,15 @@ void AdbSession::readerThread() {
         while (!is_aborted_) {
             ssize_t bytes_read = adb_read(local_fd_.get(), buffer, sizeof(buffer));
             if (bytes_read <= 0) break;
-            if (device_->listener_) {
-                device_->listener_->onShellData(device_->getSerial(), session_id_, buffer, bytes_read, false);
-            }
+            const std::string serial = device_->getSerial();
+            device_->withListener([&](IDeviceListener& l) {
+                l.onShellData(serial, session_id_, buffer, bytes_read, false);
+            });
         }
     }
 
-    if (device_->listener_) {
-        device_->listener_->onSessionClosed(device_->getSerial(), session_id_, exit_code);
-    }
+    const std::string serial = device_->getSerial();
+    device_->withListener([&](IDeviceListener& l) { l.onSessionClosed(serial, session_id_, exit_code); });
     try {
         exit_code_promise_.set_value(exit_code);
     } catch (...) {

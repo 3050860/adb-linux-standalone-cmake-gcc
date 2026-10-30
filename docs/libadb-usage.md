@@ -1,6 +1,6 @@
 # libadb — Руководство по использованию
 
-**Версия:** 1.0.0 | **API:** C++20
+**Версия:** 1.1.0 | **API:** C++20
 
 Библиотека управляет Android-устройствами по TCP напрямую из кода — без adb-сервера.
 Поддержаны: push/pull, shell, install, uninstall, события, таймауты, отмена, async.
@@ -70,6 +70,9 @@ opts.timeouts.slot_acquire   = libadb::ms{30000};  // ms::max() = бесконе
 opts.on_event          = handler_fn;
 opts.progress_interval = libadb::ms{200};
 opts.event_queue_limit = 10000;
+
+// Окно delayed ack на поток (по умолчанию 1 МБ, не меньше 64 КБ)
+opts.delayed_ack_window = 1024 * 1024;
 
 // Параллелизм
 opts.max_connections      = 4;
@@ -218,7 +221,7 @@ auto op = device->push_async("/tmp/file", "/data/local/tmp/file");
 op->wait();                    // бесконечно
 op->wait(libadb::ms{5000});   // false — не дождались
 op->cancel();
-// Status::DeviceBusy — если Device уже занят
+// несколько *_async на одном Device идут одновременно (с 1.1)
 
 auto batch = client.push_all_async(
     {"192.168.1.10","192.168.1.11"}, "/local", "/remote");
@@ -292,7 +295,7 @@ SONAME `libadb.so.1` — C++ ABI совместим внутри одного MA
 | AuthRequired | ждёт подтверждения ключа на экране |
 | Offline / DeviceLost | устройство отпало |
 | SlotBusy / SlotTimeout | лимит подключений |
-| DeviceBusy | второй `*_async` на занятом Device |
+| DeviceBusy | `connect()` к адресу, у которого уже открыт Device (до 1.1 — второй `*_async`) |
 | CommandTimeout / StallTimeout | таймаут по времени / прогрессу |
 | Canceled / ConnectionClosed | явная отмена / `close_all()` |
 | IoError / LocalFileError | ошибка канала / нет файла |
@@ -305,7 +308,12 @@ SONAME `libadb.so.1` — C++ ABI совместим внутри одного MA
 ## Потокобезопасность
 
 - `Client` — все методы безопасны из любого потока.
-- `Device` — **не** потокобезопасен: одна операция за раз.
+- `Device` — потокобезопасен (с 1.1): операции из разных потоков идут
+  одновременно по одному транспорту (мультиплексирование потоков ADB). В полёте
+  на поток — не больше 1 МБ неподтверждённых данных, поэтому большой push не
+  задерживает короткие команды. `close()` — из любого потока.
+- Подключение к адресу одно на процесс: второй `connect()` к нему, пока первый
+  `Device` открыт, сразу даёт `DeviceBusy` — используйте общий `DevicePtr`.
 - `on_event` — диспетчер-поток, не блокировать надолго.
 
 ---

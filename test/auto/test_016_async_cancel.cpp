@@ -1,7 +1,8 @@
 // test_016: асинхронный режим и отмена (§9 спецификации, этап 8).
 // Проверяем: push_async/shell_async работают и не блокируют вызывающего;
-// wait(timeout) отличает «не дождались» от «готово»; второй *_async на занятом
-// устройстве даёт DeviceBusy; Operation::cancel() и Client::cancel(id) реально
+// wait(timeout) отличает «не дождались» от «готово»; второй *_async на том же
+// устройстве выполняется одновременно с первым (мультиплексирование, 1.1);
+// Operation::cancel() и Client::cancel(id) реально
 // прерывают синхронную и асинхронную работу; close_all() даёт ConnectionClosed
 // (а не Canceled); BatchOperation обрабатывает список адресов.
 //
@@ -122,11 +123,14 @@ int main(int argc, char** argv) {
     check(!op->wait(libadb::ms{300}), "wait(300ms) не дождался");
     check(!op->done(), "операция ещё не завершена");
 
-    // --- 2. Второй *_async на занятом устройстве → DeviceBusy ---------------
-    auto busy_op = device->shell_async("echo nope", libadb::ShellOptions{});
-    check(busy_op->done(), "второй *_async завершён сразу");
-    check(busy_op->result().status == libadb::Status::DeviceBusy, "второй *_async → DeviceBusy",
-          libadb::to_string(busy_op->result().status));
+    // --- 2. Второй *_async на том же устройстве идёт параллельно -------------
+    // (до 1.1 он сразу завершался с DeviceBusy)
+    check(device->busy(), "busy() во время *_async");
+    auto second_op = device->shell_async("echo parallel", libadb::ShellOptions{});
+    check(second_op->wait(libadb::ms{5000}), "второй *_async завершился, пока первый идёт");
+    check(second_op->result().ok() && second_op->result().output == "parallel\n",
+          "второй *_async → свой вывод", second_op->result().output);
+    check(!op->done(), "первая операция всё ещё идёт");
 
     // --- 3. wait() без таймаута дожидается и отдаёт Result ------------------
     check(op->wait(), "wait() дождался");

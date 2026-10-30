@@ -68,11 +68,11 @@ int main(int argc, char** argv) {
           "version.h.in НЕ установлен (это шаблон сборки)");
 
     // --- 2. Библиотека и симлинки версий -------------------------------------
-    check(exists(libdir + "/libadb.so.1.0.0"), "установлен libadb.so.1.0.0");
+    check(exists(libdir + "/libadb.so." LIBADB_VERSION_STRING), "установлен libadb.so." LIBADB_VERSION_STRING);
     check(exists(libdir + "/libadb.so.1"), "установлен SONAME-симлинк libadb.so.1");
     check(exists(libdir + "/libadb.so"), "установлен линковочный симлинк libadb.so");
 
-    const std::string soname = run("readelf -d " + libdir + "/libadb.so.1.0.0 | grep SONAME");
+    const std::string soname = run("readelf -d " + libdir + "/libadb.so." LIBADB_VERSION_STRING " | grep SONAME");
     check(contains(soname, "libadb.so.1"), "SONAME внутри файла — libadb.so.1", soname);
 
     // --- 3. pkg-config --------------------------------------------------------
@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     check(exists(libdir + "/pkgconfig/libadb.pc"), "установлен libadb.pc");
 
     const std::string version = run(pc_env + "pkg-config --modversion libadb");
-    check(contains(version, "1.0.0"), "pkg-config --modversion", version);
+    check(contains(version, LIBADB_VERSION_STRING), "pkg-config --modversion", version);
 
     const std::string libs = run(pc_env + "pkg-config --libs libadb");
     check(contains(libs, "-ladb"), "pkg-config --libs содержит -ladb", libs);
@@ -114,19 +114,19 @@ int main(int argc, char** argv) {
 
     // --- 5. Публичные символы .so --------------------------------------------
     const std::string exported =
-            run("nm -D --defined-only " + libdir + "/libadb.so.1.0.0 | grep -c ' T '");
+            run("nm -D --defined-only " + libdir + "/libadb.so." LIBADB_VERSION_STRING " | grep -c ' T '");
     printf("[INFO] экспортировано символов: %s", exported.c_str());
 
     const std::string leaked = run("nm -D --defined-only " + libdir +
-                                   "/libadb.so.1.0.0 | grep -icE 'SSL_|EVP_|BIO_new|ZipArchive'");
+                                   "/libadb.so." LIBADB_VERSION_STRING " | grep -icE 'SSL_|EVP_|BIO_new|ZipArchive'");
     check(contains(leaked, "0"), "символы BoringSSL/ziparchive наружу не видны", leaked);
 
     const std::string internals = run("nm -D --defined-only " + libdir +
-                                      "/libadb.so.1.0.0 | grep -icE 'libadb8internal'");
+                                      "/libadb.so." LIBADB_VERSION_STRING " | grep -icE 'libadb8internal'");
     check(contains(internals, "0"), "внутренние символы libadb::internal скрыты", internals);
 
     // --- 6. Сама библиотека работоспособна -----------------------------------
-    check(std::string(libadb::version()) == "1.0.0", "libadb::version()", libadb::version());
+    check(std::string(libadb::version()) == LIBADB_VERSION_STRING, "libadb::version()", libadb::version());
     check((libadb::version_number() >> 16) == LIBADB_VERSION_MAJOR,
           "MAJOR из version_number() совпадает с заголовком",
           std::to_string(libadb::version_number() >> 16));

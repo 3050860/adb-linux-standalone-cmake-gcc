@@ -456,16 +456,19 @@ void FacadeListener::onAuthRequired(const std::string& /*serial*/) {
                          "authorization required: accept the RSA key on the device");
 }
 
-void FacadeListener::onShellData(const std::string& /*serial*/, uint32_t /*session_id*/,
+void FacadeListener::onShellData(const std::string& serial, uint32_t session_id,
                                  const char* data, size_t len, bool is_stderr) {
     std::lock_guard<std::mutex> lock(output_mutex_);
-    if (output_.buffer) output_.buffer->append(data, len);
-    if (output_.callback && *output_.callback) {
-        (*output_.callback)(serial_, std::string_view(data, len), is_stderr);
+    auto it = outputs_.find(session_id);
+    if (it == outputs_.end()) return;
+    const OutputTarget& output = it->second;
+    if (output.buffer) output.buffer->append(data, len);
+    if (output.callback && *output.callback) {
+        (*output.callback)(serial, std::string_view(data, len), is_stderr);
     }
     // Событие OperationOutput: сам Event уходит в очередь, поэтому подписчик
     // не тормозит reader-поток сессии.
-    if (output_.op) output_.op->output(std::string_view(data, len), is_stderr);
+    if (output.op) output.op->output(std::string_view(data, len), is_stderr);
 }
 
 void FacadeListener::onSessionClosed(const std::string& /*serial*/, uint32_t /*session_id*/,
@@ -496,14 +499,14 @@ Status FacadeListener::wait_until_online(ms timeout) {
     return signaled ? Status::ConnectFailed : Status::ConnectTimeout;
 }
 
-void FacadeListener::set_output_target(const OutputTarget& target) {
+void FacadeListener::set_output_target(uint32_t session_id, const OutputTarget& target) {
     std::lock_guard<std::mutex> lock(output_mutex_);
-    output_ = target;
+    outputs_[session_id] = target;
 }
 
-void FacadeListener::clear_output_target() {
+void FacadeListener::clear_output_target(uint32_t session_id) {
     std::lock_guard<std::mutex> lock(output_mutex_);
-    output_ = OutputTarget{};
+    outputs_.erase(session_id);
 }
 
 std::string FacadeListener::take_error() {
@@ -551,19 +554,23 @@ DevicePtr DeviceFactory::create(std::unique_ptr<Device::Impl> impl) {
 // ---------------------------------------------------------------------------
 
 void Device::Impl::close() {
-    if (!closed) {
-        closed = true;
-
+    std::lock_guard<std::mutex> lock(close_mutex);
+    if (!closed.exchange(true)) {
         // Операции этого устройства должны узнать причину: соединение закрыли,
         // это не IoError и не их собственная отмена (§9).
         internal::OperationRegistry::instance().close(serial);
 
-        // Порядок важен: сначала отпускаем свой shared_ptr на AdbDevice, потом
-        // просим менеджер убрать транспорт — иначе устройство осталось бы живым
-        // и следующий connect получил бы старое соединение.
-        device.reset();
-        if (!serial.empty()) {
-            AdbManager::instance().disconnectDevice(serial);
+        // Менеджер убирает устройство из реестра (только наше: следующий connect к
+        // адресу создаст новое) и закрывает транспорт. AdbDevice::close()
+        // идемпотентен, поэтому деструктор AdbDevice потом не тронет чужой транспорт
+        // с тем же серийником.
+        if (device) {
+            AdbManager::instance().disconnectDevice(address_key, device.get());
+            device->close();
+            // listener уничтожается вместе с Impl, а потоки adb (в том числе поток
+            // подключения, который мог не уложиться в connect_timeout) живут дольше:
+            // отцепляем его, дождавшись текущего вызова.
+            device->detachListener(listener.get());
         }
         internal::emit_log(LogLevel::Debug, serial, "disconnected");
         internal::publish_device_event(EventType::DeviceDisconnected, serial, Status::Ok,
@@ -597,7 +604,7 @@ const std::string& Device::serial() const {
 }
 
 bool Device::is_online() const {
-    if (impl_->closed || !impl_->device) return false;
+    if (impl_->closed.load() || !impl_->device) return false;
     return impl_->listener->online() && impl_->device->getTransport() != nullptr;
 }
 
@@ -753,11 +760,12 @@ Result Device::Impl::run_shell(const std::string& command, const ShellOptions& o
     if (options.capture_output) target.buffer = &result.output;
     if (options.on_output) target.callback = &options.on_output;
     target.op = op;
-    listener->set_output_target(target);
 
     auto session = device->createShellSession(command);
+    // Приёмник — до start(): reader-поток сессии начинает отдавать вывод сразу
+    if (session) listener->set_output_target(session->getId(), target);
     if (!session || !session->start()) {
-        listener->clear_output_target();
+        if (session) listener->clear_output_target(session->getId());
         result.status = Status::Internal;
         result.error = "failed to start shell session";
         result.duration = elapsed_since(started);
@@ -793,10 +801,12 @@ Result Device::Impl::run_shell(const std::string& command, const ShellOptions& o
     // Без abort() reader-поток остался бы висеть на adb_read() до конца жизни
     // процесса, а деструктор AdbSession ждал бы его join().
     // abort() синхронно закрывает и наш конец socketpair, и asocket внутри
-    // fdevent-потока (см. AdbSession::abort), поэтому следующая команда на этом
-    // устройстве создаётся уже на чистом состоянии.
+    // fdevent-потока (см. AdbSession::abort). Другие сессии устройства это не задевает.
     if (!finished) session->abort();
-    listener->clear_output_target();
+    listener->clear_output_target(session->getId());
+    // close()/close_all() из другого потока рвут сессию, и она «завершается» сама
+    // (EOF) раньше, чем мы заметим отмену между порциями ожидания
+    if (finished && op && op->canceled()) canceled = true;
 
     if (canceled) {
         result.status = op->cancel_status();
@@ -854,14 +864,6 @@ Result Device::Impl::run_install_attempt(const std::vector<std::string>& paths,
     const uint64_t apk_size = total_size;
 
     Result result;
-    // Вывод pm приходит теми же событиями, что и shell: собираем его, чтобы
-    // вытащить причину отказа (INSTALL_FAILED_*).
-    internal::OutputTarget target;
-    target.buffer = &result.output;
-    if (options.on_output) target.callback = &options.on_output;
-    target.op = &op;
-    listener->set_output_target(target);
-
     op.set_phase(Phase::CreateSession);
 
     InstallMonitor monitor;
@@ -912,8 +914,12 @@ Result Device::Impl::run_install_attempt(const std::vector<std::string>& paths,
     const bool ok = install_ok.load(std::memory_order_acquire) && monitor.reason == Status::Ok;
     const ms transfer_duration = elapsed_since(transfer_started);
 
-    listener->clear_output_target();
-    device->clearActiveSessions();
+    // Вывод pm (статусные строки) собран в result.output перехватом в рабочем потоке;
+    // отдаём его и тем, кто ждёт вывод потоком.
+    if (!result.output.empty()) {
+        if (options.on_output) options.on_output(serial, result.output, false);
+        op.output(result.output, false);
+    }
 
     result.duration = elapsed_since(started);
     // Байты берём от наблюдателя: install-write мог залить не весь файл (ошибка),
@@ -1180,19 +1186,12 @@ Result Device::uninstall(const std::string& package, const UninstallOptions& opt
 
 namespace {
 
-// Общий каркас *_async: одна операция на устройство, работа уходит в пул.
+// Общий каркас *_async: работа уходит в пул. Операции одного устройства идут
+// одновременно (мультиплексирование), ограничивает их только размер пула.
 // task вызывается в потоке пула и возвращает Result.
 OperationPtr start_async(const DevicePtr& device, Device::Impl& impl, Command command,
                          std::function<Result()> task) {
-    // Занятость проверяем и захватываем одним обменом: два *_async из разных
-    // потоков не должны оба «успеть».
-    bool expected = false;
-    if (!impl.async_busy.compare_exchange_strong(expected, true)) {
-        Result busy;
-        busy.status = Status::DeviceBusy;
-        busy.error = "device is busy with another asynchronous operation";
-        return internal::OperationFactory::completed(command, impl.serial, std::move(busy));
-    }
+    impl.async_active.fetch_add(1);
 
     auto op_impl = std::make_unique<Operation::Impl>();
     op_impl->command = command;
@@ -1213,7 +1212,7 @@ OperationPtr start_async(const DevicePtr& device, Device::Impl& impl, Command co
             internal::PendingCancelFlag pending(raw->flag);
             result = task();
         }
-        impl.async_busy.store(false);
+        impl.async_active.fetch_sub(1);
         raw->complete(std::move(result));
     });
     return operation;
@@ -1259,7 +1258,7 @@ OperationPtr Device::uninstall_async(const std::string& package, const Uninstall
 }
 
 bool Device::busy() const {
-    return impl_->async_busy.load();
+    return impl_->async_active.load() > 0;
 }
 
 size_t Device::cancel_current() {

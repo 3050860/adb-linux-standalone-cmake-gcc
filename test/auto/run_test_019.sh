@@ -11,7 +11,9 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-BUILD="$REPO/build"
+# BUILD можно переопределить: каталог build мог быть настроен под examples/
+BUILD="${BUILD:-$REPO/build}"
+VERSION=$(sed -n 's/^project(ADB VERSION \([0-9.]*\)).*/\1/p' "$REPO/CMakeLists.txt")
 STAGE=/tmp/libadb-stage-019
 PREFIX="$STAGE/usr"
 LIBDIR="$PREFIX/lib/x86_64-linux-gnu"
@@ -80,8 +82,8 @@ check $? "compile consumer with pkg-config flags"
 if [ -x "$WORK/consumer_pc" ]; then
     OUT=$("$WORK/consumer_pc")
     check $? "run pkg-config consumer"
-    echo "$OUT" | grep -q "libadb 1.0.0"
-    check $? "consumer reports libadb 1.0.0 ($(echo "$OUT" | head -1))"
+    echo "$OUT" | grep -q "libadb $VERSION"
+    check $? "consumer reports libadb $VERSION ($(echo "$OUT" | head -1))"
     echo "$OUT" | grep -q "parsed 192.168.1.10:5555"
     check $? "consumer used DeviceAddress::parse"
 else
@@ -117,8 +119,8 @@ check $? "build consumer via libadb::adb"
 if [ -x "$WORK/cmake_consumer/build/consumer" ]; then
     LD_LIBRARY_PATH="$LIBDIR" "$WORK/cmake_consumer/build/consumer" > "$WORK/cmake_run.log" 2>&1
     check $? "run CMake consumer"
-    grep -q "libadb 1.0.0" "$WORK/cmake_run.log"
-    check $? "CMake consumer reports libadb 1.0.0"
+    grep -q "libadb $VERSION" "$WORK/cmake_run.log"
+    check $? "CMake consumer reports libadb $VERSION"
 else
     sed -n '1,25p' "$WORK/cmake_consumer_cfg.log" "$WORK/cmake_consumer_build.log"
     failures=$((failures+1))

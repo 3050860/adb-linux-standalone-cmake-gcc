@@ -120,6 +120,24 @@ std::shared_ptr<AdbDevice> AdbManager::connectDevice(const std::string& address,
     return nullptr;
 }
 
+void AdbManager::disconnectDevice(const std::string& address, const AdbDevice* device) {
+    std::shared_ptr<AdbDevice> removed;
+    {
+        std::lock_guard<std::mutex> lock(devices_mutex_);
+        auto it = devices_.find(address);
+        if (it == devices_.end() || it->second.get() != device) return;
+        removed = std::move(it->second);
+        devices_.erase(it);
+    }
+    // close() ждёт fdevent-цикл и прерывание сессий — вне мьютекса реестра
+    removed->close();
+}
+
+bool AdbManager::hasDevice(const std::string& address) {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return devices_.find(address) != devices_.end();
+}
+
 void AdbManager::disconnectDevice(const std::string& address) {
     std::lock_guard<std::mutex> lock(devices_mutex_);
     auto it = devices_.find(address);

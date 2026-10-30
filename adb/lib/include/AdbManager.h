@@ -46,6 +46,10 @@ public:
 
     // Отключает устройство и очищает ресурсы.
     void disconnectDevice(const std::string& address);
+    // То же, но только если по адресу зарегистрировано именно это устройство
+    void disconnectDevice(const std::string& address, const AdbDevice* device);
+    // Есть ли уже подключение (или попытка подключения) к адресу
+    bool hasDevice(const std::string& address);
 
 private:
     AdbManager() = default;

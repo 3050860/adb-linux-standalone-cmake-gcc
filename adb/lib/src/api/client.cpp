@@ -217,6 +217,9 @@ Status Client::initialize(const Options& options) {
                            "auth: " + std::to_string(adb_auth_key_count()) + " key(s) loaded");
     }
 
+    // Меньше 64 КБ — почти по пакету на подтверждение, push заметно медленнее
+    set_delayed_ack_bytes(std::max<size_t>(options.delayed_ack_window, 64 * 1024));
+
     auto& manager = AdbManager::instance();
     manager.setMaxThreads(options.max_parallel);
     impl_->slots.set_limit(options.max_connections);
@@ -271,6 +274,15 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
         return nullptr;
     }
 
+    // Подключение к адресу одно на процесс: транспорт adb общий, а слушатель у него
+    // один (первого Device). Второй connect ждал бы connect_timeout и при закрытии
+    // снёс бы чужое соединение — отказываем сразу.
+    if (AdbManager::instance().hasDevice(serial)) {
+        set_status(Status::DeviceBusy);
+        internal::emit_log(LogLevel::Warn, serial, "already connected by another Device");
+        return nullptr;
+    }
+
     // Слот занимаем до создания транспорта: лимит должен считать реально
     // открытые соединения, а не успешные подключения.
     const Status slot_status = impl_->slots.acquire(options.timeouts.slot_acquire, serial);
@@ -284,6 +296,7 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
     auto impl = std::make_unique<Device::Impl>();
     impl->address = address;
     impl->serial = serial;
+    impl->address_key = serial;
     impl->connect_timeout = options.timeouts.connect;
     impl->listener = std::make_unique<internal::FacadeListener>(serial);
     // Дальше любой выход из функции проходит через Impl::close() — прямо или
