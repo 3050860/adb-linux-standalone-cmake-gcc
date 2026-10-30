@@ -399,7 +399,7 @@ void handle_packet(apacket *p, atransport *t)
             s->available_send_bytes = send_bytes;
 
             // TODO: Make this adjustable at connection time?
-            send_ready(s->id, s->peer->id, t, INITIAL_DELAYED_ACK_BYTES);
+            send_ready(s->id, s->peer->id, t, delayed_ack_bytes());
         } else {
             LOG(DEBUG) << "delayed ack unavailable";
             send_ready(s->id, s->peer->id, t, 0);

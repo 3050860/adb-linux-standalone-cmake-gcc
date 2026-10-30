@@ -493,6 +493,15 @@ struct Options {
     // 0 — без ограничения (поток на устройство).
     size_t max_parallel = 0;
 
+    // Окно delayed ack: сколько неподтверждённых байт держать в полёте на один
+    // поток ADB (и сколько разрешаем устройству слать нам). Потоки устройства
+    // делят очередь транспорта: большое окно ускоряет push на каналах с большой
+    // задержкой, но задерживает короткие команды рядом с ним (adb — 32 МБ, при
+    // этом команда рядом с push ждёт секунды). Не меньше 64 КБ. Действует на
+    // потоки, открытые после initialize(); только для устройств с delayed_ack
+    // (Android 11+), остальные подтверждают каждый пакет.
+    size_t delayed_ack_window = 1024 * 1024;
+
     // Глобальный на процесс лимит одновременных подключений (§7). Общий для
     // батч-режима и ручных connect(): библиотека никогда не держит открытыми
     // больше max_connections устройств. 0 — без ограничения.
@@ -611,7 +620,11 @@ struct DeviceFactory;
 
 // Живое подключение к одному устройству. Создаётся только через Client.
 
-// Методы блокирующие; объект можно использовать из одного потока за раз.
+// Методы блокирующие и потокобезопасные (с 1.1): операции из разных потоков
+// идут одновременно — каждая своим потоком протокола ADB в общем транспорте
+// (мультиплексирование), например push большого apk и shell/скриншот. close()
+// можно вызвать из любого потока: незавершённые операции получат
+// Status::ConnectionClosed.
 // enable_shared_from_this: асинхронная операция должна продлевать жизнь
 // устройства, иначе вызывающий, отпустивший DevicePtr, снёс бы объект
 // из-под работающего воркера.
@@ -647,9 +660,8 @@ class LIBADB_API Device : public std::enable_shared_from_this<Device> {
     // --- асинхронный режим (§9) ---
     //
     // Работа уходит в отдельный пул библиотеки (Options::async_worker_threads).
-    // Второй *_async на занятом устройстве вернёт операцию, уже завершённую со
-    // Status::DeviceBusy: последовательность команд на одном устройстве —
-    // забота вызывающего.
+    // Несколько *_async на одном устройстве выполняются одновременно (с 1.1;
+    // в 1.0 второй сразу завершался со Status::DeviceBusy).
     OperationPtr push_async(const std::string& local, const std::string& remote,
                             const PushOptions& options = {});
     OperationPtr pull_async(const std::string& remote, const std::string& local,
@@ -660,7 +672,7 @@ class LIBADB_API Device : public std::enable_shared_from_this<Device> {
                                const InstallOptions& options = {});
     OperationPtr uninstall_async(const std::string& package, const UninstallOptions& options = {});
 
-    // Занято ли устройство асинхронной операцией прямо сейчас.
+    // Выполняется ли сейчас хотя бы одна *_async этого устройства.
     bool busy() const;
 
     // Отменяет операции этого устройства (и синхронные, и асинхронные).
@@ -706,6 +718,10 @@ class LIBADB_API Client {
 
     // Подключается к устройству и ждёт готовности (Options::connect_timeout).
     // При ошибке возвращает nullptr, а причина попадает в *status (если задан).
+    // Подключение к адресу одно на процесс: пока предыдущий Device этого адреса
+    // не закрыт, connect сразу возвращает nullptr со Status::DeviceBusy (до 1.1
+    // ждал connect_timeout и рвал первое подключение). Операции одного Device
+    // можно вести из разных потоков.
     DevicePtr connect(const DeviceAddress& address, Status* status = nullptr);
     DevicePtr connect(const std::string& address, Status* status = nullptr);
 

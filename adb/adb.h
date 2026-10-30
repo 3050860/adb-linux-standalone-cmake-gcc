@@ -20,7 +20,14 @@ constexpr size_t MAX_FRAMEWORK_PAYLOAD = 64 * 1024;
 
 // When delayed acks are supported, the initial number of unacknowledged bytes we're willing to
 // receive on a socket before the other side should block.
-constexpr size_t INITIAL_DELAYED_ACK_BYTES = 32 * 1024 * 1024;
+// libadb: 1 МБ вместо 32 МБ, и столько же — потолок того, что мы сами отправляем без
+// подтверждения. Потоки одного устройства идут через общую очередь транспорта: с окном
+// 32 МБ push ставил в неё мегабайты, и A_OPEN/ответы других команд ждали за ними секунды
+// (мультиплексирование, §15). Для LAN 1 МБ в полёте хватает на полную скорость.
+constexpr size_t INITIAL_DELAYED_ACK_BYTES = 1 * 1024 * 1024;
+// Текущее окно (libadb::Options::delayed_ack_window), по умолчанию INITIAL_DELAYED_ACK_BYTES
+size_t delayed_ack_bytes();
+void set_delayed_ack_bytes(size_t bytes);
 
 constexpr size_t LINUX_MAX_SOCKET_SIZE = 4194304;
 

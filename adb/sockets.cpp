@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -395,6 +396,16 @@ static void local_socket_event_func(int fd, unsigned ev, void* _s) {
     }
 }
 
+static std::atomic<size_t> g_delayed_ack_bytes{INITIAL_DELAYED_ACK_BYTES};
+
+size_t delayed_ack_bytes() {
+    return g_delayed_ack_bytes.load(std::memory_order_relaxed);
+}
+
+void set_delayed_ack_bytes(size_t bytes) {
+    g_delayed_ack_bytes.store(bytes, std::memory_order_relaxed);
+}
+
 void local_socket_ack(asocket* s, std::optional<int32_t> acked_bytes) {
     // acked_bytes can be negative!
     //
@@ -412,6 +423,11 @@ void local_socket_ack(asocket* s, std::optional<int32_t> acked_bytes) {
 
         // This can't (reasonably) overflow: available_send_bytes is 64-bit.
         *s->available_send_bytes += *acked_bytes;
+        // libadb: в полёте не больше delayed_ack_bytes(), сколько бы ни разрешило
+        // устройство (adbd даёт 32 МБ). Потоки устройства делят очередь транспорта: иначе
+        // push ставит в неё десятки мегабайт, и другие команды ждут их отправки секундами.
+        *s->available_send_bytes = std::min<int64_t>(*s->available_send_bytes,
+                                                     static_cast<int64_t>(delayed_ack_bytes()));
         if (*s->available_send_bytes > 0) {
             s->ready(s);
         }
@@ -538,7 +554,7 @@ void connect_to_remote(asocket* s, std::string_view destination) {
     p->msg.arg0 = s->id;
 
     if (s->transport->SupportsDelayedAck()) {
-        p->msg.arg1 = INITIAL_DELAYED_ACK_BYTES;
+        p->msg.arg1 = delayed_ack_bytes();
         s->available_send_bytes = 0;
     }
 

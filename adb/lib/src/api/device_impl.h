@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -52,9 +53,11 @@ class LIBADB_INTERNAL FacadeListener : public IDeviceListener {
     // Ждёт перехода в состояние device. Возвращает Status::Ok либо причину отказа.
     Status wait_until_online(ms timeout);
 
-    // Управление приёмником вывода текущей операции.
-    void set_output_target(const OutputTarget& target);
-    void clear_output_target();
+    // Приёмник вывода сессии: у каждой shell-сессии свой, вывод разводится по
+    // session_id — на одном устройстве одновременно идут несколько команд.
+    // clear дожидается текущей доставки: после него приёмник можно уничтожать.
+    void set_output_target(uint32_t session_id, const OutputTarget& target);
+    void clear_output_target(uint32_t session_id);
 
     // Последняя ошибка от устройства (для заполнения Result::error).
     std::string take_error();
@@ -76,7 +79,7 @@ class LIBADB_INTERNAL FacadeListener : public IDeviceListener {
     std::string error_;
 
     std::mutex output_mutex_;
-    OutputTarget output_;
+    std::map<uint32_t, OutputTarget> outputs_;
 };
 
 }  // namespace libadb::internal
@@ -89,10 +92,14 @@ namespace libadb {
 struct LIBADB_INTERNAL Device::Impl {
     std::string address;  // как его передал вызывающий, для сообщений и ключей результата
     std::string serial;   // "ip:port" — то, чем оперирует внутренний adb
+    std::string address_key;  // ключ в реестре AdbManager (serial до рукопожатия)
     std::shared_ptr<AdbDevice> device;
     std::unique_ptr<internal::FacadeListener> listener;
     ms connect_timeout{15000};
-    bool closed = false;
+    // Закрыть устройство можно из любого потока, в том числе пока на нём идут операции:
+    // device при закрытии не обнуляется (им пользуются эти операции), а флаг атомарный.
+    std::atomic<bool> closed{false};
+    std::mutex close_mutex;
 
     // Возврат слота подключения в пул клиента (§7). Задаётся в Client::connect
     // сразу после захвата слота; вызывается ровно один раз при закрытии.
@@ -120,9 +127,9 @@ struct LIBADB_INTERNAL Device::Impl {
                                uint64_t total_size, const InstallOptions& options,
                                const InstallTimeout& timeout, internal::OperationContext& op);
 
-    // Занято ли устройство асинхронной операцией. Синхронные вызовы этот флаг
-    // не выставляют: их последовательность — забота вызывающего.
-    std::atomic<bool> async_busy{false};
+    // Для Device::busy(). Операции на устройстве (и синхронные, и *_async) идут
+    // одновременно — каждая своим потоком протокола в общем транспорте.
+    std::atomic<int> async_active{0};  // сколько *_async этого устройства сейчас выполняется
 };
 
 namespace internal {
