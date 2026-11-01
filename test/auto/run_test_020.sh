@@ -35,6 +35,9 @@ if [ ${#CODENAMES[@]} -eq 0 ]; then
     done
 fi
 
+# Ожидаемая версия — upstream-часть последней записи debian/changelog (1.1.1-1 → 1.1.1)
+VERSION="$(sed -n '1s/^libadb (\([^-)]*\).*/\1/p' "$REPO/debian/changelog")"
+
 failures=0
 check() { if [ "$1" -eq 0 ]; then echo "[ OK ] $2"; else echo "[FAIL] $2"; failures=$((failures+1)); fi; }
 
@@ -125,7 +128,7 @@ for CODENAME in "${CODENAMES[@]}"; do
     grep -q LDCONFIG_OK   "$LOG"; check $? "$IMAGE: ldconfig видит libadb.so.1"
     grep -q PKGCONFIG_OK  "$LOG"; check $? "$IMAGE: потребитель собран через pkg-config"
     grep -q CMAKE_OK      "$LOG"; check $? "$IMAGE: потребитель собран через find_package"
-    grep -q 'libadb 1.0.0' "$LOG"; check $? "$IMAGE: библиотека сообщает версию 1.0.0"
+    grep -q "libadb $VERSION" "$LOG"; check $? "$IMAGE: библиотека сообщает версию $VERSION"
     grep -q 'parsed 10.0.0.5:5555' "$LOG"; check $? "$IMAGE: публичный API работает"
     grep -q DEPS_CLEAN    "$LOG"; check $? "$IMAGE: в Depends нет BoringSSL/ziparchive"
     grep -q ZIP_FILE_ABSENT "$LOG"; check $? "$IMAGE: libziparchive.so не установлен"

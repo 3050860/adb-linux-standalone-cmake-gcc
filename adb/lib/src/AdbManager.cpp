@@ -104,11 +104,20 @@ void AdbManager::eventLoopThread() {
     LOG(INFO) << "AdbManager: fdevent_loop stopped";
 }
 
-std::shared_ptr<AdbDevice> AdbManager::connectDevice(const std::string& address, IDeviceListener* listener) {
+std::shared_ptr<AdbDevice> AdbManager::connectDevice(const std::string& address, IDeviceListener* listener,
+                                                     bool* busy) {
     std::lock_guard<std::mutex> lock(devices_mutex_);
-    
+    if (busy) *busy = false;
+
     if (devices_.find(address) != devices_.end()) {
-        return devices_[address]; // Уже подключено
+        // Уже подключается или подключено. Libadb::Client::connect() второму вызывающему отдавал
+        // чужое устройство: его слушатель не подключался, он ждал connect_timeout и закрывал
+        // устройство первого (гонка между hasDevice() и connectDevice())
+        if (busy) {
+            *busy = true;
+            return nullptr;
+        }
+        return devices_[address];
     }
 
     auto device = std::make_shared<AdbDevice>(address, listener);

@@ -23,8 +23,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <poll.h>
 #include <sys/socket.h>
-#include <sys/select.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -74,15 +74,17 @@ int socket_network_client_timeout(const char* host, int port, int type, int time
             continue;
         }
 
-        fd_set r_set;
-        FD_ZERO(&r_set);
-        FD_SET(s, &r_set);
-        fd_set w_set = r_set;
-
-        struct timeval ts;
-        ts.tv_sec = timeout;
-        ts.tv_usec = 0;
-        if ((rc = select(s + 1, &r_set, &w_set, NULL, (timeout != 0) ? &ts : NULL)) == -1) {
+        // libadb: poll, а не select. fd_set вмещает дескрипторы только до FD_SETSIZE (1024): в процессе
+        // с тысячами открытых сокетов (сервер, к которому подключены тысячи ТВ) FD_SET(s) писал за
+        // пределы fd_set на стеке — порча стека и SIGSEGV при подключении (test_022).
+        struct pollfd pfd;
+        pfd.fd = s;
+        pfd.events = POLLIN | POLLOUT;
+        pfd.revents = 0;
+        do {
+            rc = poll(&pfd, 1, (timeout != 0) ? timeout * 1000 : -1);
+        } while (rc == -1 && errno == EINTR);
+        if (rc == -1) {
             close(s);
             break;
         }
@@ -94,12 +96,7 @@ int socket_network_client_timeout(const char* host, int port, int type, int time
 
         int error = 0;
         socklen_t len = sizeof(error);
-        if (FD_ISSET(s, &r_set) || FD_ISSET(s, &w_set)) {
-            if (getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-                close(s);
-                break;
-            }
-        } else {
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
             close(s);
             break;
         }
