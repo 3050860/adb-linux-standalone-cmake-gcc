@@ -1064,3 +1064,47 @@ spdlog, fmt, zlib, libstdc++, libm, libgcc_s, libc, ld-linux).
 - `adirect shell` на живом устройстве работает; в `readelf -d adirect` ни одной
   ссылки на удалённые `.so`.
 
+
+---
+
+## 1.1.1 — порча стека при больших номерах дескрипторов, гонка двух connect() к одному адресу
+
+**Как нашли.** Сервер netariumd (5.15.50 и 5.16) падал (SIGSEGV, разрушенный стек в коротком потоке libadb), когда
+к нему одновременно подключались тысячи новых ТВ, — модуль автоустановки проверял их по adb. Шторм подключений в
+отдельной программе (test_021) не падал, в том числе под AddressSanitizer. Сервер с libadb, собранной с ASan
+(`LD_PRELOAD=libasan`, `LD_LIBRARY_PATH=build-asan`), дал точный отчёт:
+
+```
+ERROR: AddressSanitizer: stack-buffer-overflow
+  socket_network_client_timeout  system/core/libcutils/socket_network_client_unix.cpp:79
+  network_connect                adb/sysdeps/posix/network.cpp:122
+  socket_spec_connect            adb/socket_spec.cpp:181
+  connect_device                 adb/client/transport_local.cpp:83
+  AdbDevice::initiateConnection  (поток подключения)
+```
+
+**Причина 1 (падение).** `socket_network_client_timeout` ждала неблокирующее подключение через `select()`.
+`fd_set` вмещает дескрипторы только до `FD_SETSIZE` = 1024; у сервера с тысячами TCP-соединений номер нового
+сокета больше 1023, и `FD_SET(s, &r_set)` пишет за пределы `fd_set` на стеке. В тестовой программе дескрипторов
+мало — поэтому шторм там не падал. Исправлено: `poll()` (без предела номера), `EINTR` повторяется; итог
+подключения — по-прежнему `SO_ERROR`.
+
+**Причина 2 (гонка, найдена при разборе).** `Client::connect()` проверял адрес (`hasDevice`) и регистрировал
+устройство (`AdbManager::connectDevice`) двумя операциями. Второй вызывающий, успевший между ними, получал от
+`connectDevice` **уже зарегистрированное** устройство первого: его слушатель не подключался, он ждал
+`connect_timeout` и закрывал устройство — чужое. Исправлено: `connectDevice(address, listener, &busy)` — проверка
+и регистрация под одним мьютексом реестра; занятый адрес — `nullptr` и `busy`, `connect()` возвращает
+`DeviceBusy` сразу. `adirect` (один поток) вызывает без `busy` — поведение прежнее.
+
+**Тесты.**
+- `test_022_many_fds` (`run_test_022.sh`): 1100 лишних дескрипторов, сокет подключения получает номер больше
+  1023; connect к закрытому порту и к TCP-серверу не adb. На 1.1.0 с ASan — stack-buffer-overflow в
+  `socket_network_client_unix.cpp:79`; на 1.1.1 — ALL PASSED.
+- `test_021_connect_storm` (`run_test_021.sh`): 16 потоков × 100 connect к закрытым портам (один адрес, два
+  адреса, `close_all()` в разгар). Добавлена проверка: шторм не ждёт таймаутов. На 1.1.0 прогон шёл 10–14 с
+  (вторые вызывающие ждали `connect_timeout`), на 1.1.1 — 10–100 мс.
+- Сервер netariumd (`main`, исходный модуль автоустановки) с 1.1.1 (ASan): 3400 эмулированных ТВ, подключение и
+  переподключение три раза, 2905 проверок по adb — без падения и без отчётов ASan. С 1.1.0 тот же сценарий
+  падал на первых четырёх подключениях.
+
+**Упаковка.** Версия 1.1.1; `dh_makeshlibs -V` — потребители, собранные с 1.1.1, требуют `libadb1 (>= 1.1.1)`.

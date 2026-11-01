@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(ADB VERSION 1.1.0)
+project(ADB VERSION 1.1.1)
 
 include(ExternalProject)
 # BoringSSL собираем ТОЛЬКО статически (этап 12, часть 2 плана).

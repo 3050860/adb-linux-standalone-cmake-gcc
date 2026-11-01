@@ -306,7 +306,15 @@ DevicePtr Client::connect(const std::string& address, Status* status) {
 
     internal::emit_log(LogLevel::Debug, serial, "connecting");
     internal::publish_device_event(EventType::DeviceConnecting, serial, Status::Ok, "connecting");
-    impl->device = AdbManager::instance().connectDevice(serial, impl->listener.get());
+    bool busy = false;
+    impl->device = AdbManager::instance().connectDevice(serial, impl->listener.get(), &busy);
+    if (!impl->device && busy) {
+        // Другой поток успел начать подключение к адресу между hasDevice() и сюда
+        impl->closed = true;
+        set_status(Status::DeviceBusy);
+        internal::emit_log(LogLevel::Warn, serial, "already connected by another Device");
+        return nullptr;
+    }
     if (!impl->device) {
         // Транспорт не создан — освобождать через disconnectDevice() нечего.
         impl->closed = true;

@@ -42,7 +42,11 @@ public:
 
     // Подключается к устройству по TCP (например, "192.168.1.10:5555")
     // Возвращает shared_ptr на устройство или nullptr при ошибке.
-    std::shared_ptr<AdbDevice> connectDevice(const std::string& address, IDeviceListener* listener);
+    // busy != nullptr: адрес уже подключается или подключён — nullptr и *busy = true (проверка и
+    // регистрация — одна операция под мьютексом реестра). Без busy — прежнее поведение: вернуть
+    // имеющееся устройство (adirect, один поток).
+    std::shared_ptr<AdbDevice> connectDevice(const std::string& address, IDeviceListener* listener,
+                                             bool* busy = nullptr);
 
     // Отключает устройство и очищает ресурсы.
     void disconnectDevice(const std::string& address);
