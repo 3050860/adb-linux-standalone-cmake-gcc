@@ -23,6 +23,8 @@ Technical documentation and build instructions are available in Russian. See [RE
 
 **I am the author of this system.** I have 26 years of total experience in the IT industry. While my specific tech stack has evolved over the decades, my core specialization remains constant: **optimizing high-load, mission-critical systems that operate in strict 24/7 production environments.**
 
+🌐 **Full Resume & Portfolio:** [https://3050860.github.io/resume/](https://3050860.github.io/resume/)
+
 If your engineering team is struggling with:
 - Memory leaks, race conditions, or scaling bottlenecks in C++/Linux backends.
 - Managing device fleets beyond hundreds of units (especially custom AOSP/non-GMS devices).
